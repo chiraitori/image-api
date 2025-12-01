@@ -10,9 +10,14 @@ import (
 	"image-api/handlers"
 )
 
-func main() {
-	// Load .env file if exists
+func init() {
+	// Load .env file before handlers.init() runs
 	godotenv.Load()
+}
+
+func main() {
+	// Re-initialize client with loaded env
+	handlers.InitClient()
 
 	port := os.Getenv("PORT")
 	if port == "" {

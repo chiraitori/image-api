@@ -3,6 +3,7 @@ package handlers
 import (
 	"encoding/json"
 	"io"
+	"log"
 	"math/rand"
 	"net/http"
 	"os"
@@ -26,6 +27,17 @@ var client *pixiv.Client
 func init() {
 	cookie := os.Getenv("PIXIV_COOKIE")
 	client = pixiv.NewClient(cookie)
+}
+
+// InitClient reinitializes the client (call after loading .env)
+func InitClient() {
+	cookie := os.Getenv("PIXIV_COOKIE")
+	client = pixiv.NewClient(cookie)
+	if cookie != "" {
+		log.Printf("Pixiv client initialized with cookie")
+	} else {
+		log.Printf("Pixiv client initialized without cookie (R18 content unavailable)")
+	}
 }
 
 // Response helpers
