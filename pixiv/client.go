@@ -157,23 +157,31 @@ func (c *Client) Login(username, password string) error {
 
 // IllustDetail represents the illustration details
 type IllustDetail struct {
-	ID          string   `json:"id"`
-	Title       string   `json:"title"`
-	Description string   `json:"description"`
-	UserID      string   `json:"userId"`
-	UserName    string   `json:"userName"`
-	Width       int      `json:"width"`
-	Height      int      `json:"height"`
-	PageCount   int      `json:"pageCount"`
-	Tags        []Tag    `json:"tags"`
-	CreateDate  string   `json:"createDate"`
-	URLs        ImageURL `json:"urls"`
+	ID          string      `json:"id"`
+	Title       string      `json:"title"`
+	Description string      `json:"description"`
+	UserID      string      `json:"userId"`
+	UserName    string      `json:"userName"`
+	Width       int         `json:"width"`
+	Height      int         `json:"height"`
+	PageCount   int         `json:"pageCount"`
+	Tags        TagsWrapper `json:"tags"`
+	CreateDate  string      `json:"createDate"`
+	URLs        ImageURL    `json:"urls"`
+}
+
+// TagsWrapper wraps the tags object from Pixiv API
+type TagsWrapper struct {
+	AuthorID string `json:"authorId"`
+	IsLocked bool   `json:"isLocked"`
+	Tags     []Tag  `json:"tags"`
 }
 
 // Tag represents an illustration tag
 type Tag struct {
 	Tag         string `json:"tag"`
 	Translation string `json:"translation,omitempty"`
+	Locked      bool   `json:"locked"`
 }
 
 // ImageURL contains various image URLs

@@ -241,7 +241,7 @@ func PaperbackMangaDetails(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var tags []PBTag
-	for _, tag := range illust.Tags {
+	for _, tag := range illust.Tags.Tags {
 		tags = append(tags, PBTag{ID: tag.Tag, Label: tag.Tag})
 	}
 
