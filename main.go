@@ -5,10 +5,15 @@ import (
 	"net/http"
 	"os"
 
+	"github.com/joho/godotenv"
+
 	"image-api/handlers"
 )
 
 func main() {
+	// Load .env file if exists
+	godotenv.Load()
+
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8000"
