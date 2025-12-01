@@ -179,9 +179,10 @@ type TagsWrapper struct {
 
 // Tag represents an illustration tag
 type Tag struct {
-	Tag         string `json:"tag"`
-	Translation string `json:"translation,omitempty"`
-	Locked      bool   `json:"locked"`
+	Tag         string            `json:"tag"`
+	Translation map[string]string `json:"translation,omitempty"`
+	Locked      bool              `json:"locked"`
+	Romaji      string            `json:"romaji,omitempty"`
 }
 
 // ImageURL contains various image URLs
