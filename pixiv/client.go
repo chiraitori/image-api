@@ -265,7 +265,12 @@ func (c *Client) doRequest(method, url string) (*http.Response, error) {
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 
 	if c.cookie != "" {
-		req.Header.Set("Cookie", c.cookie)
+		// Check if cookie already has PHPSESSID= prefix
+		if strings.HasPrefix(c.cookie, "PHPSESSID=") {
+			req.Header.Set("Cookie", c.cookie)
+		} else {
+			req.Header.Set("Cookie", "PHPSESSID="+c.cookie)
+		}
 	}
 
 	return c.httpClient.Do(req)
