@@ -79,7 +79,8 @@ func KemonoPosts(w http.ResponseWriter, r *http.Request) {
 // @Failure 500 {object} map[string]string
 // @Router /api/kemono/creators [get]
 func KemonoCreators(w http.ResponseWriter, r *http.Request) {
-	apiURL := fmt.Sprintf("%s/creators.txt", KEMONO_API_URL)
+	// The correct endpoint is /v1/creators (without .txt extension)
+	apiURL := KEMONO_API_URL + "/creators"
 
 	data, err := fetchKemonoAPI(apiURL)
 	if err != nil {
