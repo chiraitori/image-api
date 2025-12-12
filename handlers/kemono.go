@@ -32,12 +32,13 @@ func KemonoPosts(w http.ResponseWriter, r *http.Request) {
 
 	var apiURL string
 
-	// Route: /{service}/posts - NOT actually per-service, just use /v1/posts
+	// Route: /{service}/posts - use ?service= query param for filtering
 	if len(parts) == 2 && parts[1] == "posts" {
+		service := parts[0]
 		offset := r.URL.Query().Get("o")
-		apiURL = fmt.Sprintf("%s/posts", KEMONO_API_URL)
+		apiURL = fmt.Sprintf("%s/posts?service=%s", KEMONO_API_URL, service)
 		if offset != "" {
-			apiURL += "?o=" + offset
+			apiURL += "&o=" + offset
 		}
 	// Route: /{service}/user/{user_id}
 	} else if len(parts) == 3 && parts[1] == "user" {
