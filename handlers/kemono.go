@@ -150,7 +150,7 @@ func fetchKemonoAPI(apiURL string) ([]byte, error) {
 	}
 
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Accept", "text/css")  // Required by Kemono's DDoS-Guard
 	req.Header.Set("Referer", KEMONO_BASE_URL)
 
 	resp, err := kemonoClient.Do(req)
