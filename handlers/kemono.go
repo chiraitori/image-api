@@ -31,14 +31,15 @@ func KemonoPosts(w http.ResponseWriter, r *http.Request) {
 	parts := strings.Split(path, "/")
 
 	var apiURL string
+	var filterService string
 
-	// Route: /{service}/posts - use ?service= query param for filtering
+	// Route: /{service}/posts - fetch all and filter by service server-side
 	if len(parts) == 2 && parts[1] == "posts" {
-		service := parts[0]
+		filterService = parts[0]
 		offset := r.URL.Query().Get("o")
-		apiURL = fmt.Sprintf("%s/posts?service=%s", KEMONO_API_URL, service)
+		apiURL = fmt.Sprintf("%s/posts", KEMONO_API_URL)
 		if offset != "" {
-			apiURL += "&o=" + offset
+			apiURL += "?o=" + offset
 		}
 	// Route: /{service}/user/{user_id}
 	} else if len(parts) == 3 && parts[1] == "user" {
@@ -64,6 +65,26 @@ func KemonoPosts(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+
+	// If service filtering is needed, parse and filter the response
+	if filterService != "" {
+		var response map[string]interface{}
+		if err := json.Unmarshal(data, &response); err == nil {
+			if posts, ok := response["posts"].([]interface{}); ok {
+				var filtered []interface{}
+				for _, post := range posts {
+					if p, ok := post.(map[string]interface{}); ok {
+						if svc, ok := p["service"].(string); ok && svc == filterService {
+							filtered = append(filtered, post)
+						}
+					}
+				}
+				response["posts"] = filtered
+				response["count"] = len(filtered)
+				data, _ = json.Marshal(response)
+			}
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
