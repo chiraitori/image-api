@@ -9,6 +9,7 @@ A Go-based REST API for fetching images and illustrations from Pixiv.
 - Search illustrations by keyword
 - Get daily/weekly/monthly rankings
 - Proxy Pixiv images (bypasses referer restrictions)
+- **OAuth 2.0 authentication** with PKCE (access tokens + refresh tokens)
 
 ## Setup
 
@@ -102,6 +103,49 @@ GET /api/image/i.pximg.net/...
 
 This endpoint proxies images from Pixiv's image servers, adding the required Referer header.
 
+### Authentication
+
+#### Set OAuth Tokens
+```
+POST /api/auth/token
+Content-Type: application/json
+
+{
+  "access_token": "your_access_token",
+  "refresh_token": "your_refresh_token"
+}
+```
+
+#### Exchange Authorization Code
+```
+POST /api/auth/code
+Content-Type: application/json
+
+{
+  "code": "authorization_code_from_pixiv",
+  "code_verifier": "your_pkce_code_verifier"
+}
+```
+
+#### Refresh Access Token
+```
+POST /api/auth/refresh
+```
+
+#### Check Auth Status
+```
+GET /api/auth/status
+```
+
+Returns:
+```json
+{
+  "logged_in": true,
+  "has_cookie": false,
+  "has_access_token": true,
+  "has_refresh_token": true
+}
+```
 ## Response Format
 
 ### Success Response

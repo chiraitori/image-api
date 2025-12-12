@@ -33,10 +33,21 @@ func init() {
 func InitClient() {
 	cookie := os.Getenv("PIXIV_COOKIE")
 	client = pixiv.NewClient(cookie)
+	
+	// Load OAuth tokens from environment
+	accessToken := os.Getenv("PIXIV_ACCESS_TOKEN")
+	refreshToken := os.Getenv("PIXIV_REFRESH_TOKEN")
+	if accessToken != "" {
+		client.SetTokens(accessToken, refreshToken)
+		log.Printf("Pixiv client initialized with OAuth tokens")
+	}
+	
 	if cookie != "" {
 		log.Printf("Pixiv client initialized with cookie")
-	} else {
-		log.Printf("Pixiv client initialized without cookie (R18 content unavailable)")
+	}
+	
+	if cookie == "" && accessToken == "" {
+		log.Printf("Pixiv client initialized without auth (R18 content unavailable)")
 	}
 }
 
@@ -73,7 +84,29 @@ type LoginRequest struct {
 	Cookie   string `json:"cookie"`
 }
 
-// Login handles /api/login requests
+// TokenRequest represents OAuth token credentials
+type TokenRequest struct {
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token"`
+}
+
+// CodeExchangeRequest represents OAuth code exchange request
+type CodeExchangeRequest struct {
+	Code         string `json:"code"`
+	CodeVerifier string `json:"code_verifier"`
+}
+
+// Login godoc
+// @Summary Login to Pixiv
+// @Description Authenticate using username/password or cookie
+// @Tags auth
+// @Accept json
+// @Produce json
+// @Param request body LoginRequest true "Login credentials"
+// @Success 200 {object} APISuccess
+// @Failure 400 {object} APIError
+// @Failure 401 {object} APIError
+// @Router /api/login [post]
 func Login(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
@@ -113,25 +146,161 @@ func Login(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// AuthStatus handles /api/auth/status requests
+// AuthStatus godoc
+// @Summary Check authentication status
+// @Description Returns the current authentication status including cookie and token info
+// @Tags auth
+// @Produce json
+// @Success 200 {object} APISuccess
+// @Router /api/auth/status [get]
 func AuthStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
 		return
 	}
 
+	accessToken, refreshToken := client.GetTokens()
 	writeSuccess(w, map[string]interface{}{
-		"logged_in":  client.IsLoggedIn(),
-		"has_cookie": client.GetCookie() != "",
+		"logged_in":         client.IsLoggedIn(),
+		"has_cookie":        client.GetCookie() != "",
+		"has_access_token":  accessToken != "",
+		"has_refresh_token": refreshToken != "",
 	})
 }
 
-// HealthCheck handles health check requests
+// SetTokens godoc
+// @Summary Set OAuth tokens
+// @Description Sets OAuth access and refresh tokens directly
+// @Tags auth
+// @Accept json
+// @Produce json
+// @Param request body TokenRequest true "Token credentials"
+// @Success 200 {object} APISuccess
+// @Failure 400 {object} APIError
+// @Router /api/auth/token [post]
+func SetTokens(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	var req TokenRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+
+	if req.AccessToken == "" {
+		writeError(w, http.StatusBadRequest, "Access token is required")
+		return
+	}
+
+	client.SetTokens(req.AccessToken, req.RefreshToken)
+	writeSuccess(w, map[string]interface{}{
+		"message":   "Tokens set successfully",
+		"logged_in": true,
+	})
+}
+
+// ExchangeCode godoc
+// @Summary Exchange authorization code for tokens
+// @Description Exchanges a Pixiv OAuth authorization code for access and refresh tokens (PKCE)
+// @Tags auth
+// @Accept json
+// @Produce json
+// @Param request body CodeExchangeRequest true "Authorization code and verifier"
+// @Success 200 {object} APISuccess
+// @Failure 400 {object} APIError
+// @Failure 401 {object} APIError
+// @Router /api/auth/code [post]
+func ExchangeCode(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	var req CodeExchangeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+
+	if req.Code == "" || req.CodeVerifier == "" {
+		writeError(w, http.StatusBadRequest, "Code and code_verifier are required")
+		return
+	}
+
+	tokenResp, err := client.ExchangeCode(req.Code, req.CodeVerifier)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+
+	writeSuccess(w, map[string]interface{}{
+		"message":       "Token exchange successful",
+		"logged_in":     true,
+		"access_token":  tokenResp.AccessToken,
+		"refresh_token": tokenResp.RefreshToken,
+		"expires_in":    tokenResp.ExpiresIn,
+		"user": map[string]interface{}{
+			"id":      tokenResp.User.ID,
+			"name":    tokenResp.User.Name,
+			"account": tokenResp.User.Account,
+		},
+	})
+}
+
+// RefreshToken godoc
+// @Summary Refresh access token
+// @Description Refreshes the access token using the stored refresh token
+// @Tags auth
+// @Produce json
+// @Success 200 {object} APISuccess
+// @Failure 401 {object} APIError
+// @Router /api/auth/refresh [post]
+func RefreshToken(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	tokenResp, err := client.RefreshAccessToken()
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+
+	writeSuccess(w, map[string]interface{}{
+		"message":       "Token refresh successful",
+		"logged_in":     true,
+		"access_token":  tokenResp.AccessToken,
+		"refresh_token": tokenResp.RefreshToken,
+		"expires_in":    tokenResp.ExpiresIn,
+	})
+}
+
+// HealthCheck godoc
+// @Summary Health check endpoint
+// @Description Returns OK if the server is running
+// @Tags health
+// @Produce json
+// @Success 200 {object} APISuccess
+// @Router /health [get]
 func HealthCheck(w http.ResponseWriter, r *http.Request) {
 	writeSuccess(w, map[string]string{"status": "ok"})
 }
 
-// GetIllust handles /api/illust/{id} requests
+// GetIllust godoc
+// @Summary Get illustration details
+// @Description Fetches illustration details by ID. Add /pages suffix or ?pages=true for all pages.
+// @Tags illustrations
+// @Produce json
+// @Param id path string true "Illustration ID"
+// @Param pages query bool false "Get all pages"
+// @Success 200 {object} APISuccess
+// @Failure 400 {object} APIError
+// @Failure 500 {object} APIError
+// @Router /api/illust/{id} [get]
 func GetIllust(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
@@ -168,7 +337,16 @@ func GetIllust(w http.ResponseWriter, r *http.Request) {
 	writeSuccess(w, illust)
 }
 
-// ProxyImage handles /api/image/ requests to proxy Pixiv images
+// ProxyImage godoc
+// @Summary Proxy Pixiv images
+// @Description Proxies images from Pixiv's image servers with proper headers
+// @Tags images
+// @Produce image/png,image/jpeg,image/gif
+// @Param url query string false "Pixiv image URL to proxy"
+// @Success 200 {file} binary
+// @Failure 400 {object} APIError
+// @Failure 500 {object} APIError
+// @Router /api/image/ [get]
 func ProxyImage(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
@@ -210,7 +388,18 @@ func ProxyImage(w http.ResponseWriter, r *http.Request) {
 	io.Copy(w, body)
 }
 
-// SearchIllusts handles /api/search requests
+// SearchIllusts godoc
+// @Summary Search illustrations
+// @Description Search Pixiv illustrations by keyword
+// @Tags illustrations
+// @Produce json
+// @Param keyword query string false "Search keyword"
+// @Param q query string false "Search keyword (alias)"
+// @Param page query int false "Page number" default(1)
+// @Success 200 {object} APISuccess
+// @Failure 400 {object} APIError
+// @Failure 500 {object} APIError
+// @Router /api/search [get]
 func SearchIllusts(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
@@ -242,7 +431,17 @@ func SearchIllusts(w http.ResponseWriter, r *http.Request) {
 	writeSuccess(w, results)
 }
 
-// RandomImage handles /image requests - shows a random SINGLE image from ranking (no manga)
+// RandomImage godoc
+// @Summary Get random image
+// @Description Returns a random single-page illustration from Pixiv ranking
+// @Tags images
+// @Produce image/png,image/jpeg,image/gif
+// @Param mode query string false "Ranking mode: daily, weekly, monthly, rookie, original, male, female, daily_ai" default(daily)
+// @Param quality query string false "Image quality: original, regular, small, thumb, mini" default(original)
+// @Success 200 {file} binary
+// @Failure 404 {object} APIError
+// @Failure 500 {object} APIError
+// @Router /image [get]
 func RandomImage(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
@@ -260,11 +459,16 @@ func RandomImage(w http.ResponseWriter, r *http.Request) {
 		quality = "original"
 	}
 
-	// Fetch ranking to get random image
-	results, err := client.GetRanking(mode, 1, "")
+	// Fetch from a random page (1-10) for better variety
+	randomPage := randomInt(10) + 1
+	results, err := client.GetRanking(mode, randomPage, "")
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
+		// Fallback to page 1 if random page fails
+		results, err = client.GetRanking(mode, 1, "")
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 	}
 
 	if len(results.Contents) == 0 {
@@ -381,7 +585,19 @@ func RandomImage(w http.ResponseWriter, r *http.Request) {
 	io.Copy(w, body)
 }
 
-// RandomManga handles /manga requests - shows random multi-page manga works
+// RandomManga godoc
+// @Summary Get random manga page
+// @Description Returns a random page from a multi-page manga work
+// @Tags images
+// @Produce image/png,image/jpeg,image/gif
+// @Param mode query string false "Ranking mode: daily, weekly, monthly, rookie, original, male, female, daily_ai" default(daily)
+// @Param quality query string false "Image quality: original, regular, small, thumb, mini" default(original)
+// @Param page query int false "Specific page index (0-indexed), default random"
+// @Param all query bool false "Return JSON with all page URLs instead of image"
+// @Success 200 {file} binary
+// @Failure 404 {object} APIError
+// @Failure 500 {object} APIError
+// @Router /manga [get]
 func RandomManga(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
@@ -408,11 +624,16 @@ func RandomManga(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Fetch ranking to get manga
-	results, err := client.GetRanking(mode, 1, "")
+	// Fetch from a random page (1-10) for better variety
+	randomPage := randomInt(10) + 1
+	results, err := client.GetRanking(mode, randomPage, "")
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
+		// Fallback to page 1 if random page fails
+		results, err = client.GetRanking(mode, 1, "")
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 	}
 
 	if len(results.Contents) == 0 {
@@ -532,7 +753,18 @@ func RandomManga(w http.ResponseWriter, r *http.Request) {
 	io.Copy(w, body)
 }
 
-// GetRanking handles /api/ranking requests
+// GetRanking godoc
+// @Summary Get illustration ranking
+// @Description Fetches Pixiv illustration ranking by mode
+// @Tags illustrations
+// @Produce json
+// @Param mode query string false "Ranking mode: daily, weekly, monthly, rookie, original, daily_r18, weekly_r18, male, female, daily_ai" default(daily)
+// @Param page query int false "Page number" default(1)
+// @Param date query string false "Specific date in YYYYMMDD format"
+// @Success 200 {object} APISuccess
+// @Failure 400 {object} APIError
+// @Failure 500 {object} APIError
+// @Router /api/ranking [get]
 func GetRanking(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")

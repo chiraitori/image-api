@@ -1,0 +1,475 @@
+basePath: /
+definitions:
+  handlers.APIError:
+    properties:
+      error:
+        type: boolean
+      message:
+        type: string
+    type: object
+  handlers.APISuccess:
+    properties:
+      data: {}
+      error:
+        type: boolean
+    type: object
+  handlers.CodeExchangeRequest:
+    properties:
+      code:
+        type: string
+      code_verifier:
+        type: string
+    type: object
+  handlers.LoginRequest:
+    properties:
+      cookie:
+        type: string
+      password:
+        type: string
+      username:
+        type: string
+    type: object
+  handlers.TokenRequest:
+    properties:
+      access_token:
+        type: string
+      refresh_token:
+        type: string
+    type: object
+host: localhost:8000
+info:
+  contact:
+    name: API Support
+    url: https://github.com/chiraitori/image-api
+  description: A REST API for fetching images and illustrations from Pixiv
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+  termsOfService: http://swagger.io/terms/
+  title: Pixiv Image API
+  version: "1.0"
+paths:
+  /api/auth/code:
+    post:
+      consumes:
+      - application/json
+      description: Exchanges a Pixiv OAuth authorization code for access and refresh
+        tokens (PKCE)
+      parameters:
+      - description: Authorization code and verifier
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.CodeExchangeRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handlers.APISuccess'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/handlers.APIError'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/handlers.APIError'
+      summary: Exchange authorization code for tokens
+      tags:
+      - auth
+  /api/auth/refresh:
+    post:
+      description: Refreshes the access token using the stored refresh token
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handlers.APISuccess'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/handlers.APIError'
+      summary: Refresh access token
+      tags:
+      - auth
+  /api/auth/status:
+    get:
+      description: Returns the current authentication status including cookie and
+        token info
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handlers.APISuccess'
+      summary: Check authentication status
+      tags:
+      - auth
+  /api/auth/token:
+    post:
+      consumes:
+      - application/json
+      description: Sets OAuth access and refresh tokens directly
+      parameters:
+      - description: Token credentials
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.TokenRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handlers.APISuccess'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/handlers.APIError'
+      summary: Set OAuth tokens
+      tags:
+      - auth
+  /api/illust/{id}:
+    get:
+      description: Fetches illustration details by ID. Add /pages suffix or ?pages=true
+        for all pages.
+      parameters:
+      - description: Illustration ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Get all pages
+        in: query
+        name: pages
+        type: boolean
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handlers.APISuccess'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/handlers.APIError'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/handlers.APIError'
+      summary: Get illustration details
+      tags:
+      - illustrations
+  /api/image/:
+    get:
+      description: Proxies images from Pixiv's image servers with proper headers
+      parameters:
+      - description: Pixiv image URL to proxy
+        in: query
+        name: url
+        type: string
+      produces:
+      - image/png
+      - image/jpeg
+      - image/gif
+      responses:
+        "200":
+          description: OK
+          schema:
+            type: file
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/handlers.APIError'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/handlers.APIError'
+      summary: Proxy Pixiv images
+      tags:
+      - images
+  /api/kemono/{service}/posts:
+    get:
+      description: Returns posts from a specific Kemono service (fanbox, patreon,
+        etc.)
+      parameters:
+      - description: Service name (fanbox, patreon, discord, fantia, afdian, boosty,
+          gumroad, subscribestar, dlsite)
+        in: path
+        name: service
+        required: true
+        type: string
+      - description: Offset for pagination
+        in: query
+        name: o
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              type: object
+            type: array
+        "500":
+          description: Internal Server Error
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Get Kemono posts by service
+      tags:
+      - Kemono
+  /api/kemono/creators:
+    get:
+      description: Returns list of all creators
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              type: object
+            type: array
+        "500":
+          description: Internal Server Error
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Get all Kemono creators
+      tags:
+      - Kemono
+  /api/kemono/proxy:
+    get:
+      description: Proxies files from Kemono CDN
+      parameters:
+      - description: File path on Kemono
+        in: query
+        name: path
+        required: true
+        type: string
+      produces:
+      - application/octet-stream
+      responses:
+        "200":
+          description: OK
+          schema:
+            type: file
+        "500":
+          description: Internal Server Error
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Proxy Kemono files (images/videos)
+      tags:
+      - Kemono
+  /api/login:
+    post:
+      consumes:
+      - application/json
+      description: Authenticate using username/password or cookie
+      parameters:
+      - description: Login credentials
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.LoginRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handlers.APISuccess'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/handlers.APIError'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/handlers.APIError'
+      summary: Login to Pixiv
+      tags:
+      - auth
+  /api/ranking:
+    get:
+      description: Fetches Pixiv illustration ranking by mode
+      parameters:
+      - default: daily
+        description: 'Ranking mode: daily, weekly, monthly, rookie, original, daily_r18,
+          weekly_r18, male, female, daily_ai'
+        in: query
+        name: mode
+        type: string
+      - default: 1
+        description: Page number
+        in: query
+        name: page
+        type: integer
+      - description: Specific date in YYYYMMDD format
+        in: query
+        name: date
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handlers.APISuccess'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/handlers.APIError'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/handlers.APIError'
+      summary: Get illustration ranking
+      tags:
+      - illustrations
+  /api/search:
+    get:
+      description: Search Pixiv illustrations by keyword
+      parameters:
+      - description: Search keyword
+        in: query
+        name: keyword
+        type: string
+      - description: Search keyword (alias)
+        in: query
+        name: q
+        type: string
+      - default: 1
+        description: Page number
+        in: query
+        name: page
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handlers.APISuccess'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/handlers.APIError'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/handlers.APIError'
+      summary: Search illustrations
+      tags:
+      - illustrations
+  /health:
+    get:
+      description: Returns OK if the server is running
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handlers.APISuccess'
+      summary: Health check endpoint
+      tags:
+      - health
+  /image:
+    get:
+      description: Returns a random single-page illustration from Pixiv ranking
+      parameters:
+      - default: daily
+        description: 'Ranking mode: daily, weekly, monthly, rookie, original, male,
+          female, daily_ai'
+        in: query
+        name: mode
+        type: string
+      - default: original
+        description: 'Image quality: original, regular, small, thumb, mini'
+        in: query
+        name: quality
+        type: string
+      produces:
+      - image/png
+      - image/jpeg
+      - image/gif
+      responses:
+        "200":
+          description: OK
+          schema:
+            type: file
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/handlers.APIError'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/handlers.APIError'
+      summary: Get random image
+      tags:
+      - images
+  /manga:
+    get:
+      description: Returns a random page from a multi-page manga work
+      parameters:
+      - default: daily
+        description: 'Ranking mode: daily, weekly, monthly, rookie, original, male,
+          female, daily_ai'
+        in: query
+        name: mode
+        type: string
+      - default: original
+        description: 'Image quality: original, regular, small, thumb, mini'
+        in: query
+        name: quality
+        type: string
+      - description: Specific page index (0-indexed), default random
+        in: query
+        name: page
+        type: integer
+      - description: Return JSON with all page URLs instead of image
+        in: query
+        name: all
+        type: boolean
+      produces:
+      - image/png
+      - image/jpeg
+      - image/gif
+      responses:
+        "200":
+          description: OK
+          schema:
+            type: file
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/handlers.APIError'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/handlers.APIError'
+      summary: Get random manga page
+      tags:
+      - images
+schemes:
+- http
+- https
+swagger: "2.0"

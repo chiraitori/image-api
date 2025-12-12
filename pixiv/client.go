@@ -1,13 +1,16 @@
 package pixiv
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -16,13 +19,48 @@ const (
 	ajaxURL    = "https://www.pixiv.net/ajax"
 	imageProxy = "https://i.pximg.net"
 	loginURL   = "https://accounts.pixiv.net/api/login"
+
+	// OAuth endpoints
+	oauthTokenURL = "https://oauth.secure.pixiv.net/auth/token"
+	appAPIURL     = "https://app-api.pixiv.net"
 )
+
+// OAuth credentials - loaded from environment variables
+var (
+	oauthClientID     = getEnvOrDefault("PIXIV_CLIENT_ID", "MOBrBDS8blbauoSck0ZfDbtuzpyT")
+	oauthClientSecret = getEnvOrDefault("PIXIV_CLIENT_SECRET", "lsACyCD94FhDUtGTXi3QzcFE2uU1hqtDaKeqrdwj")
+)
+
+func getEnvOrDefault(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
+}
 
 // Client represents a Pixiv API client
 type Client struct {
-	httpClient *http.Client
-	cookie     string
-	loggedIn   bool
+	httpClient   *http.Client
+	cookie       string
+	accessToken  string
+	refreshToken string
+	loggedIn     bool
+	mu           sync.RWMutex
+}
+
+// OAuthTokenResponse represents the OAuth token response from Pixiv
+type OAuthTokenResponse struct {
+	AccessToken  string `json:"access_token"`
+	ExpiresIn    int    `json:"expires_in"`
+	TokenType    string `json:"token_type"`
+	Scope        string `json:"scope"`
+	RefreshToken string `json:"refresh_token"`
+	User         struct {
+		ID        string `json:"id"`
+		Name      string `json:"name"`
+		Account   string `json:"account"`
+		IsMailAuth bool  `json:"is_mail_authorized"`
+	} `json:"user"`
 }
 
 // LoginCredentials holds login information
@@ -52,12 +90,112 @@ func (c *Client) SetCookie(cookie string) {
 
 // GetCookie returns the current cookie
 func (c *Client) GetCookie() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	return c.cookie
 }
 
 // IsLoggedIn returns whether the client is authenticated
 func (c *Client) IsLoggedIn() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	return c.loggedIn
+}
+
+// SetTokens sets OAuth access and refresh tokens
+func (c *Client) SetTokens(accessToken, refreshToken string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.accessToken = accessToken
+	c.refreshToken = refreshToken
+	c.loggedIn = accessToken != ""
+}
+
+// GetTokens returns the current OAuth tokens
+func (c *Client) GetTokens() (accessToken, refreshToken string) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.accessToken, c.refreshToken
+}
+
+// HasTokens returns whether OAuth tokens are set
+func (c *Client) HasTokens() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.accessToken != ""
+}
+
+// ExchangeCode exchanges an authorization code for access and refresh tokens
+func (c *Client) ExchangeCode(code, codeVerifier string) (*OAuthTokenResponse, error) {
+	data := url.Values{}
+	data.Set("client_id", oauthClientID)
+	data.Set("client_secret", oauthClientSecret)
+	data.Set("code", code)
+	data.Set("code_verifier", codeVerifier)
+	data.Set("grant_type", "authorization_code")
+	data.Set("include_policy", "true")
+	data.Set("redirect_uri", "https://app-api.pixiv.net/web/v1/users/auth/pixiv/callback")
+
+	return c.requestToken(data)
+}
+
+// RefreshAccessToken refreshes the access token using the refresh token
+func (c *Client) RefreshAccessToken() (*OAuthTokenResponse, error) {
+	c.mu.RLock()
+	refreshToken := c.refreshToken
+	c.mu.RUnlock()
+
+	if refreshToken == "" {
+		return nil, fmt.Errorf("no refresh token available")
+	}
+
+	data := url.Values{}
+	data.Set("client_id", oauthClientID)
+	data.Set("client_secret", oauthClientSecret)
+	data.Set("grant_type", "refresh_token")
+	data.Set("refresh_token", refreshToken)
+	data.Set("include_policy", "true")
+
+	return c.requestToken(data)
+}
+
+// requestToken makes a token request to Pixiv OAuth endpoint
+func (c *Client) requestToken(data url.Values) (*OAuthTokenResponse, error) {
+	req, err := http.NewRequest("POST", oauthTokenURL, bytes.NewBufferString(data.Encode()))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("User-Agent", "PixivAndroidApp/5.0.234 (Android 11; Pixel 5)")
+	req.Header.Set("App-OS", "android")
+	req.Header.Set("App-OS-Version", "11")
+	req.Header.Set("App-Version", "5.0.234")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("OAuth error (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	var tokenResp OAuthTokenResponse
+	if err := json.Unmarshal(body, &tokenResp); err != nil {
+		return nil, fmt.Errorf("failed to parse token response: %w", err)
+	}
+
+	// Store the tokens
+	c.SetTokens(tokenResp.AccessToken, tokenResp.RefreshToken)
+
+	return &tokenResp, nil
 }
 
 // Login authenticates with Pixiv using username and password
