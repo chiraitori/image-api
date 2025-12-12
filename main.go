@@ -23,9 +23,9 @@ import (
 // @license.name MIT
 // @license.url https://opensource.org/licenses/MIT
 
-// @host localhost:8000
+// @host image.chiraitori.io.vn
 // @BasePath /
-// @schemes http https
+// @schemes https http
 
 func init() {
 	// Load .env file before handlers.init() runs

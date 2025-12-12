@@ -710,9 +710,9 @@ const docTemplate = `{
 // SwaggerInfo holds exported Swagger Info so clients can modify it
 var SwaggerInfo = &swag.Spec{
 	Version:          "1.0",
-	Host:             "localhost:8000",
+	Host:             "image.chiraitori.io.vn",
 	BasePath:         "/",
-	Schemes:          []string{"http", "https"},
+	Schemes:          []string{"https", "http"},
 	Title:            "Pixiv Image API",
 	Description:      "A REST API for fetching images and illustrations from Pixiv",
 	InfoInstanceName: "swagger",
