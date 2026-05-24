@@ -33,20 +33,28 @@ func init() {
 func InitClient() {
 	cookie := os.Getenv("PIXIV_COOKIE")
 	client = pixiv.NewClient(cookie)
-	
+
 	// Load OAuth tokens from environment
 	accessToken := os.Getenv("PIXIV_ACCESS_TOKEN")
 	refreshToken := os.Getenv("PIXIV_REFRESH_TOKEN")
-	if accessToken != "" {
+	if accessToken != "" || refreshToken != "" {
 		client.SetTokens(accessToken, refreshToken)
-		log.Printf("Pixiv client initialized with OAuth tokens")
+		if refreshToken != "" {
+			if _, err := client.RefreshAccessToken(); err != nil {
+				log.Printf("Pixiv OAuth token refresh failed: %v", err)
+			} else {
+				log.Printf("Pixiv client refreshed OAuth tokens")
+			}
+		} else {
+			log.Printf("Pixiv client initialized with OAuth access token")
+		}
 	}
-	
+
 	if cookie != "" {
 		log.Printf("Pixiv client initialized with cookie")
 	}
-	
-	if cookie == "" && accessToken == "" {
+
+	if cookie == "" && accessToken == "" && refreshToken == "" {
 		log.Printf("Pixiv client initialized without auth (R18 content unavailable)")
 	}
 }
@@ -310,7 +318,7 @@ func GetIllust(w http.ResponseWriter, r *http.Request) {
 	// Extract illust ID from path: /api/illust/12345
 	path := strings.TrimPrefix(r.URL.Path, "/api/illust/")
 	illustID := strings.TrimSuffix(path, "/")
-	
+
 	if illustID == "" {
 		writeError(w, http.StatusBadRequest, "Illustration ID is required")
 		return
@@ -384,7 +392,7 @@ func ProxyImage(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Cache-Control", "public, max-age=86400")
-	
+
 	io.Copy(w, body)
 }
 
@@ -500,24 +508,11 @@ func RandomImage(w http.ResponseWriter, r *http.Request) {
 	// Fetch the actual illustration pages to get original quality URL
 	illustID := strconv.Itoa(item.GetIllustID())
 	pages, err := client.GetIllustPages(illustID)
-	
+
 	var imageURL string
 	if err == nil && len(pages) > 0 {
 		// Use the pages API for best quality
-		switch quality {
-		case "original":
-			imageURL = pages[0].Original
-		case "regular":
-			imageURL = pages[0].Regular
-		case "small":
-			imageURL = pages[0].Small
-		case "thumb":
-			imageURL = pages[0].Thumb
-		case "mini":
-			imageURL = pages[0].Mini
-		default:
-			imageURL = pages[0].Original
-		}
+		imageURL = pages[0].URLForQuality(quality)
 	}
 
 	// Fallback: try to construct original URL from thumbnail
@@ -533,7 +528,7 @@ func RandomImage(w http.ResponseWriter, r *http.Request) {
 		imageURL = strings.Replace(imageURL, "_master1200", "", 1)
 		imageURL = strings.Replace(imageURL, "_square1200", "", 1)
 		imageURL = strings.Replace(imageURL, "img-master", "img-original", 1)
-		
+
 		// Try common extensions for original
 		if !strings.Contains(imageURL, ".") {
 			imageURL += ".jpg"
@@ -554,7 +549,7 @@ func RandomImage(w http.ResponseWriter, r *http.Request) {
 		for _, ext := range []string{".png", ".jpg", ".jpeg", ".gif"} {
 			baseURL = strings.TrimSuffix(baseURL, ext)
 		}
-		
+
 		for _, ext := range extensions {
 			tryURL := baseURL + ext
 			body, contentType, err = client.ProxyImage(tryURL)
@@ -563,7 +558,7 @@ func RandomImage(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	
+
 	// Final fallback to thumbnail
 	if err != nil {
 		body, contentType, err = client.ProxyImage(item.URL)
@@ -677,11 +672,11 @@ func RandomManga(w http.ResponseWriter, r *http.Request) {
 	// If "all" is requested, return JSON with all page URLs
 	if r.URL.Query().Get("all") == "true" {
 		writeSuccess(w, map[string]interface{}{
-			"illust_id":   item.GetIllustID(),
-			"title":       item.Title,
-			"author":      item.UserName,
-			"page_count":  len(pages),
-			"pages":       pages,
+			"illust_id":  item.GetIllustID(),
+			"title":      item.Title,
+			"author":     item.UserName,
+			"page_count": len(pages),
+			"pages":      pages,
 		})
 		return
 	}
@@ -694,21 +689,7 @@ func RandomManga(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Get the image URL for the selected page
-	var imageURL string
-	switch quality {
-	case "original":
-		imageURL = pages[pageIndex].Original
-	case "regular":
-		imageURL = pages[pageIndex].Regular
-	case "small":
-		imageURL = pages[pageIndex].Small
-	case "thumb":
-		imageURL = pages[pageIndex].Thumb
-	case "mini":
-		imageURL = pages[pageIndex].Mini
-	default:
-		imageURL = pages[pageIndex].Original
-	}
+	imageURL := pages[pageIndex].URLForQuality(quality)
 
 	if imageURL == "" {
 		writeError(w, http.StatusNotFound, "Image URL not found")
@@ -724,7 +705,7 @@ func RandomManga(w http.ResponseWriter, r *http.Request) {
 		for _, ext := range []string{".png", ".jpg", ".jpeg", ".gif"} {
 			baseURL = strings.TrimSuffix(baseURL, ext)
 		}
-		
+
 		for _, ext := range extensions {
 			tryURL := baseURL + ext
 			body, contentType, err = client.ProxyImage(tryURL)
@@ -733,7 +714,7 @@ func RandomManga(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	
+
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -778,16 +759,16 @@ func GetRanking(w http.ResponseWriter, r *http.Request) {
 
 	// Validate mode
 	validModes := map[string]bool{
-		"daily":          true,
-		"weekly":         true,
-		"monthly":        true,
-		"rookie":         true,
-		"original":       true,
-		"daily_r18":      true,
-		"weekly_r18":     true,
-		"male":           true,
-		"female":         true,
-		"daily_ai":       true,
+		"daily":      true,
+		"weekly":     true,
+		"monthly":    true,
+		"rookie":     true,
+		"original":   true,
+		"daily_r18":  true,
+		"weekly_r18": true,
+		"male":       true,
+		"female":     true,
+		"daily_ai":   true,
 	}
 	if !validModes[mode] {
 		writeError(w, http.StatusBadRequest, "Invalid ranking mode")

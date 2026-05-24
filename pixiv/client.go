@@ -56,10 +56,10 @@ type OAuthTokenResponse struct {
 	Scope        string `json:"scope"`
 	RefreshToken string `json:"refresh_token"`
 	User         struct {
-		ID        string `json:"id"`
-		Name      string `json:"name"`
-		Account   string `json:"account"`
-		IsMailAuth bool  `json:"is_mail_authorized"`
+		ID         string `json:"id"`
+		Name       string `json:"name"`
+		Account    string `json:"account"`
+		IsMailAuth bool   `json:"is_mail_authorized"`
 	} `json:"user"`
 }
 
@@ -84,6 +84,8 @@ func NewClient(cookie string) *Client {
 
 // SetCookie updates the client cookie
 func (c *Client) SetCookie(cookie string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.cookie = cookie
 	c.loggedIn = cookie != ""
 }
@@ -116,6 +118,30 @@ func (c *Client) GetTokens() (accessToken, refreshToken string) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.accessToken, c.refreshToken
+}
+
+func normalizeCookie(cookie string) string {
+	cookie = strings.TrimSpace(cookie)
+	if cookie == "" {
+		return ""
+	}
+
+	if strings.HasPrefix(cookie, "PHPSESSID:") {
+		return "PHPSESSID=" + strings.TrimSpace(strings.TrimPrefix(cookie, "PHPSESSID:"))
+	}
+
+	// Accept either a raw PHPSESSID value or a complete Cookie header.
+	if strings.Contains(cookie, "=") || strings.Contains(cookie, ";") {
+		return cookie
+	}
+
+	return "PHPSESSID=" + cookie
+}
+
+func (c *Client) cookieHeader() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return normalizeCookie(c.cookie)
 }
 
 // HasTokens returns whether OAuth tokens are set
@@ -325,11 +351,47 @@ type Tag struct {
 
 // ImageURL contains various image URLs
 type ImageURL struct {
-	Mini     string `json:"mini"`
-	Thumb    string `json:"thumb"`
-	Small    string `json:"small"`
-	Regular  string `json:"regular"`
-	Original string `json:"original"`
+	Mini      string `json:"mini"`
+	Thumb     string `json:"thumb"`
+	ThumbMini string `json:"thumb_mini,omitempty"`
+	Small     string `json:"small"`
+	Regular   string `json:"regular"`
+	Original  string `json:"original"`
+}
+
+func (u *ImageURL) Normalize() {
+	if u.Mini == "" {
+		u.Mini = u.ThumbMini
+	}
+	if u.Thumb == "" {
+		u.Thumb = firstNonEmpty(u.ThumbMini, u.Mini, u.Small)
+	}
+}
+
+func (u ImageURL) URLForQuality(quality string) string {
+	switch quality {
+	case "original":
+		return u.Original
+	case "regular":
+		return u.Regular
+	case "small":
+		return u.Small
+	case "thumb":
+		return firstNonEmpty(u.Thumb, u.ThumbMini, u.Mini, u.Small)
+	case "mini":
+		return firstNonEmpty(u.Mini, u.ThumbMini, u.Thumb, u.Small)
+	default:
+		return u.Original
+	}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 // APIResponse represents the standard Pixiv API response
@@ -390,9 +452,24 @@ func (r RankingItem) GetPageCount() int {
 	return int(v)
 }
 
-// doRequest performs an HTTP request with Pixiv headers
-func (c *Client) doRequest(method, url string) (*http.Response, error) {
-	req, err := http.NewRequest(method, url, nil)
+// doRequest performs an HTTP request with Pixiv headers. If a stale cookie
+// turns a public JSON endpoint into a login/error response, retry anonymously.
+func (c *Client) doRequest(method, requestURL string) (*http.Response, error) {
+	resp, err := c.doRequestWithAuth(method, requestURL, true)
+	if err != nil {
+		return nil, err
+	}
+
+	if method == http.MethodGet && c.cookieHeader() != "" && shouldRetryWithoutAuth(resp) {
+		resp.Body.Close()
+		return c.doRequestWithAuth(method, requestURL, false)
+	}
+
+	return resp, nil
+}
+
+func (c *Client) doRequestWithAuth(method, requestURL string, includeAuth bool) (*http.Response, error) {
+	req, err := http.NewRequest(method, requestURL, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -402,22 +479,30 @@ func (c *Client) doRequest(method, url string) (*http.Response, error) {
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 
-	if c.cookie != "" {
-		// Check if cookie already has PHPSESSID= prefix
-		if strings.HasPrefix(c.cookie, "PHPSESSID=") {
-			req.Header.Set("Cookie", c.cookie)
-		} else {
-			req.Header.Set("Cookie", "PHPSESSID="+c.cookie)
+	if includeAuth {
+		if cookie := c.cookieHeader(); cookie != "" {
+			req.Header.Set("Cookie", cookie)
 		}
 	}
 
 	return c.httpClient.Do(req)
 }
 
+func shouldRetryWithoutAuth(resp *http.Response) bool {
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return true
+	}
+
+	contentType := resp.Header.Get("Content-Type")
+	return resp.StatusCode == http.StatusOK &&
+		contentType != "" &&
+		!strings.Contains(strings.ToLower(contentType), "application/json")
+}
+
 // GetIllustDetail fetches illustration details by ID
 func (c *Client) GetIllustDetail(illustID string) (*IllustDetail, error) {
 	url := fmt.Sprintf("%s/illust/%s", ajaxURL, illustID)
-	
+
 	resp, err := c.doRequest("GET", url)
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
@@ -441,6 +526,7 @@ func (c *Client) GetIllustDetail(illustID string) (*IllustDetail, error) {
 	if err := json.Unmarshal(apiResp.Body, &illust); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal illust: %w", err)
 	}
+	illust.URLs.Normalize()
 
 	return &illust, nil
 }
@@ -448,7 +534,7 @@ func (c *Client) GetIllustDetail(illustID string) (*IllustDetail, error) {
 // GetIllustPages fetches all pages of an illustration
 func (c *Client) GetIllustPages(illustID string) ([]ImageURL, error) {
 	url := fmt.Sprintf("%s/illust/%s/pages", ajaxURL, illustID)
-	
+
 	resp, err := c.doRequest("GET", url)
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
@@ -478,6 +564,7 @@ func (c *Client) GetIllustPages(illustID string) ([]ImageURL, error) {
 	urls := make([]ImageURL, len(pages))
 	for i, p := range pages {
 		urls[i] = p.URLs
+		urls[i].Normalize()
 	}
 
 	return urls, nil
@@ -486,9 +573,9 @@ func (c *Client) GetIllustPages(illustID string) ([]ImageURL, error) {
 // SearchIllusts searches for illustrations
 func (c *Client) SearchIllusts(keyword string, page int) (*SearchResult, error) {
 	escapedKeyword := url.QueryEscape(keyword)
-	reqURL := fmt.Sprintf("%s/search/artworks/%s?word=%s&order=date_d&mode=all&p=%d&s_mode=s_tag&type=all", 
+	reqURL := fmt.Sprintf("%s/search/artworks/%s?word=%s&order=date_d&mode=all&p=%d&s_mode=s_tag&type=all",
 		ajaxURL, escapedKeyword, escapedKeyword, page)
-	
+
 	resp, err := c.doRequest("GET", reqURL)
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
@@ -528,7 +615,7 @@ func (c *Client) SearchIllusts(keyword string, page int) (*SearchResult, error) 
 		}, nil
 	}
 
-	// Structure 2: {illust: {data: [...], total: N}}  
+	// Structure 2: {illust: {data: [...], total: N}}
 	var searchBody2 struct {
 		Illust struct {
 			Data  []IllustBrief `json:"data"`
@@ -582,7 +669,7 @@ func (c *Client) GetRanking(mode string, page int, date string) (*RankingResult,
 	if date != "" {
 		reqURL += "&date=" + date
 	}
-	
+
 	resp, err := c.doRequest("GET", reqURL)
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
