@@ -3,6 +3,7 @@ package handlers
 import (
 	"encoding/json"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 )
@@ -26,16 +27,16 @@ type PaperbackRepository struct {
 }
 
 type PaperbackManga struct {
-	ID          string   `json:"id"`
-	Title       string   `json:"title"`
-	Author      string   `json:"author"`
-	Artist      string   `json:"artist"`
-	Desc        string   `json:"desc"`
-	Cover       string   `json:"image"`
-	Status      string   `json:"status"`
-	Tags        []PBTag  `json:"tags,omitempty"`
-	LastUpdate  string   `json:"lastUpdate,omitempty"`
-	Hentai      bool     `json:"hentai"`
+	ID         string  `json:"id"`
+	Title      string  `json:"title"`
+	Author     string  `json:"author"`
+	Artist     string  `json:"artist"`
+	Desc       string  `json:"desc"`
+	Cover      string  `json:"image"`
+	Status     string  `json:"status"`
+	Tags       []PBTag `json:"tags,omitempty"`
+	LastUpdate string  `json:"lastUpdate,omitempty"`
+	Hentai     bool    `json:"hentai"`
 }
 
 type PBTag struct {
@@ -44,12 +45,12 @@ type PBTag struct {
 }
 
 type PaperbackChapter struct {
-	ID        string  `json:"id"`
-	Name      string  `json:"name"`
-	ChapNum   float64 `json:"chapNum"`
-	Time      float64 `json:"time"`
-	MangaID   string  `json:"mangaId"`
-	LangCode  string  `json:"langCode"`
+	ID       string  `json:"id"`
+	Name     string  `json:"name"`
+	ChapNum  float64 `json:"chapNum"`
+	Time     float64 `json:"time"`
+	MangaID  string  `json:"mangaId"`
+	LangCode string  `json:"langCode"`
 }
 
 type PaperbackHomeSection struct {
@@ -85,20 +86,20 @@ func PaperbackVersioning(w http.ResponseWriter, r *http.Request) {
 func PaperbackSourceList(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
-	
+
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"name":        "Pixiv Source",
 		"description": "Read manga and illustrations from Pixiv",
 		"author":      "image-api",
 		"sources": []map[string]interface{}{
 			{
-				"id":            "pixiv",
-				"name":          "Pixiv",
-				"version":       "1.0.0",
-				"icon":          "icon.png",
-				"description":   "Browse and read manga from Pixiv",
-				"contentRating": "ADULT",
-				"language":      "ja",
+				"id":             "pixiv",
+				"name":           "Pixiv",
+				"version":        "1.0.0",
+				"icon":           "icon.png",
+				"description":    "Browse and read manga from Pixiv",
+				"contentRating":  "ADULT",
+				"language":       "ja",
 				"websiteBaseURL": "https://www.pixiv.net",
 			},
 		},
@@ -314,9 +315,12 @@ func PaperbackPages(w http.ResponseWriter, r *http.Request) {
 
 	var pageURLs []string
 	for _, page := range pages {
-		imageURL := page.Original
+		imageURL := page.Regular
 		if imageURL == "" {
-			imageURL = page.Regular
+			imageURL = page.Small
+		}
+		if imageURL == "" {
+			imageURL = page.Original
 		}
 		pageURLs = append(pageURLs, buildImageProxyURL(r, imageURL))
 	}
@@ -363,5 +367,5 @@ func buildImageProxyURL(r *http.Request, imageURL string) string {
 		scheme = fwd
 	}
 	host := r.Host
-	return scheme + "://" + host + "/api/image/?url=" + imageURL
+	return scheme + "://" + host + "/api/image/?url=" + url.QueryEscape(imageURL)
 }

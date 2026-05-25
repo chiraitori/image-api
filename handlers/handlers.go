@@ -22,6 +22,20 @@ func randomInt(max int) int {
 	return rand.Intn(max)
 }
 
+func imageQualityOrDefault(quality string) string {
+	if quality == "" {
+		return "regular"
+	}
+	return quality
+}
+
+func rankingImageURL(item pixiv.RankingItem, quality string) string {
+	if quality == "original" {
+		return ""
+	}
+	return item.URL
+}
+
 var client *pixiv.Client
 
 func init() {
@@ -382,18 +396,29 @@ func ProxyImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, contentType, err := client.ProxyImage(imageURL)
+	imageResp, err := client.ProxyImageResponseWithRange(imageURL, r.Header.Get("Range"))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	defer body.Close()
+	defer imageResp.Body.Close()
 
-	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Content-Type", imageResp.ContentType)
 	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Cache-Control", "public, max-age=86400")
+	w.Header().Set("Cache-Control", "public, max-age=604800, immutable")
+	w.Header().Set("Accept-Ranges", "bytes")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	if imageResp.ContentRange != "" {
+		w.Header().Set("Content-Range", imageResp.ContentRange)
+	}
+	if imageResp.ContentLength > 0 {
+		w.Header().Set("Content-Length", strconv.FormatInt(imageResp.ContentLength, 10))
+	}
+	if imageResp.StatusCode == http.StatusPartialContent {
+		w.WriteHeader(http.StatusPartialContent)
+	}
 
-	io.Copy(w, body)
+	io.Copy(w, imageResp.Body)
 }
 
 // SearchIllusts godoc
@@ -445,7 +470,7 @@ func SearchIllusts(w http.ResponseWriter, r *http.Request) {
 // @Tags images
 // @Produce image/png,image/jpeg,image/gif
 // @Param mode query string false "Ranking mode: daily, weekly, monthly, rookie, original, male, female, daily_ai" default(daily)
-// @Param quality query string false "Image quality: original, regular, small, thumb, mini" default(original)
+// @Param quality query string false "Image quality: original, regular, small, thumb, mini" default(regular)
 // @Success 200 {file} binary
 // @Failure 404 {object} APIError
 // @Failure 500 {object} APIError
@@ -462,10 +487,7 @@ func RandomImage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Quality parameter: original (default), regular, small, thumb, mini
-	quality := r.URL.Query().Get("quality")
-	if quality == "" {
-		quality = "original"
-	}
+	quality := imageQualityOrDefault(r.URL.Query().Get("quality"))
 
 	// Fetch from a random page (1-10) for better variety
 	randomPage := randomInt(10) + 1
@@ -507,12 +529,13 @@ func RandomImage(w http.ResponseWriter, r *http.Request) {
 
 	// Fetch the actual illustration pages to get original quality URL
 	illustID := strconv.Itoa(item.GetIllustID())
-	pages, err := client.GetIllustPages(illustID)
-
-	var imageURL string
-	if err == nil && len(pages) > 0 {
-		// Use the pages API for best quality
-		imageURL = pages[0].URLForQuality(quality)
+	imageURL := rankingImageURL(item, quality)
+	if imageURL == "" {
+		pages, err := client.GetIllustPages(illustID)
+		if err == nil && len(pages) > 0 {
+			// Use the pages API for best quality
+			imageURL = pages[0].URLForQuality(quality)
+		}
 	}
 
 	// Fallback: try to construct original URL from thumbnail
@@ -586,7 +609,7 @@ func RandomImage(w http.ResponseWriter, r *http.Request) {
 // @Tags images
 // @Produce image/png,image/jpeg,image/gif
 // @Param mode query string false "Ranking mode: daily, weekly, monthly, rookie, original, male, female, daily_ai" default(daily)
-// @Param quality query string false "Image quality: original, regular, small, thumb, mini" default(original)
+// @Param quality query string false "Image quality: original, regular, small, thumb, mini" default(regular)
 // @Param page query int false "Specific page index (0-indexed), default random"
 // @Param all query bool false "Return JSON with all page URLs instead of image"
 // @Success 200 {file} binary
@@ -605,10 +628,7 @@ func RandomManga(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Quality parameter: original (default), regular, small, thumb, mini
-	quality := r.URL.Query().Get("quality")
-	if quality == "" {
-		quality = "original"
-	}
+	quality := imageQualityOrDefault(r.URL.Query().Get("quality"))
 
 	// Page parameter: which page of the manga to show (0-indexed, default random)
 	pageParam := r.URL.Query().Get("page")

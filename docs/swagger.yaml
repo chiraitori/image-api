@@ -401,7 +401,7 @@ paths:
         in: query
         name: mode
         type: string
-      - default: original
+      - default: regular
         description: 'Image quality: original, regular, small, thumb, mini'
         in: query
         name: quality
@@ -436,7 +436,7 @@ paths:
         in: query
         name: mode
         type: string
-      - default: original
+      - default: regular
         description: 'Image quality: original, regular, small, thumb, mini'
         in: query
         name: quality

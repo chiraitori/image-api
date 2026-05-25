@@ -556,7 +556,7 @@ const docTemplate = `{
                     },
                     {
                         "type": "string",
-                        "default": "original",
+                        "default": "regular",
                         "description": "Image quality: original, regular, small, thumb, mini",
                         "name": "quality",
                         "in": "query"
@@ -606,7 +606,7 @@ const docTemplate = `{
                     },
                     {
                         "type": "string",
-                        "default": "original",
+                        "default": "regular",
                         "description": "Image quality: original, regular, small, thumb, mini",
                         "name": "quality",
                         "in": "query"

@@ -46,6 +46,26 @@ type Client struct {
 	refreshToken string
 	loggedIn     bool
 	mu           sync.RWMutex
+	rankingCache map[string]rankingCacheEntry
+	pagesCache   map[string]pagesCacheEntry
+}
+
+type ImageResponse struct {
+	Body          io.ReadCloser
+	ContentType   string
+	ContentLength int64
+	ContentRange  string
+	StatusCode    int
+}
+
+type rankingCacheEntry struct {
+	result  *RankingResult
+	expires time.Time
+}
+
+type pagesCacheEntry struct {
+	urls    []ImageURL
+	expires time.Time
 }
 
 // OAuthTokenResponse represents the OAuth token response from Pixiv
@@ -76,9 +96,19 @@ func NewClient(cookie string) *Client {
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 			Jar:     jar,
+			Transport: &http.Transport{
+				Proxy:                 http.ProxyFromEnvironment,
+				MaxIdleConns:          100,
+				MaxIdleConnsPerHost:   20,
+				IdleConnTimeout:       90 * time.Second,
+				TLSHandshakeTimeout:   10 * time.Second,
+				ExpectContinueTimeout: 1 * time.Second,
+			},
 		},
-		cookie:   cookie,
-		loggedIn: cookie != "",
+		cookie:       cookie,
+		loggedIn:     cookie != "",
+		rankingCache: make(map[string]rankingCacheEntry),
+		pagesCache:   make(map[string]pagesCacheEntry),
 	}
 }
 
@@ -142,6 +172,44 @@ func (c *Client) cookieHeader() string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return normalizeCookie(c.cookie)
+}
+
+func (c *Client) getCachedPages(illustID string) ([]ImageURL, bool) {
+	c.mu.RLock()
+	entry, ok := c.pagesCache[illustID]
+	c.mu.RUnlock()
+	if !ok || time.Now().After(entry.expires) {
+		return nil, false
+	}
+	return cloneImageURLs(entry.urls), true
+}
+
+func (c *Client) setCachedPages(illustID string, urls []ImageURL) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.pagesCache[illustID] = pagesCacheEntry{
+		urls:    cloneImageURLs(urls),
+		expires: time.Now().Add(30 * time.Minute),
+	}
+}
+
+func (c *Client) getCachedRanking(key string) (*RankingResult, bool) {
+	c.mu.RLock()
+	entry, ok := c.rankingCache[key]
+	c.mu.RUnlock()
+	if !ok || time.Now().After(entry.expires) {
+		return nil, false
+	}
+	return cloneRankingResult(entry.result), true
+}
+
+func (c *Client) setCachedRanking(key string, result *RankingResult) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.rankingCache[key] = rankingCacheEntry{
+		result:  cloneRankingResult(result),
+		expires: time.Now().Add(5 * time.Minute),
+	}
 }
 
 // HasTokens returns whether OAuth tokens are set
@@ -394,6 +462,25 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
+func cloneImageURLs(urls []ImageURL) []ImageURL {
+	if urls == nil {
+		return nil
+	}
+	cloned := make([]ImageURL, len(urls))
+	copy(cloned, urls)
+	return cloned
+}
+
+func cloneRankingResult(result *RankingResult) *RankingResult {
+	if result == nil {
+		return nil
+	}
+	cloned := *result
+	cloned.Contents = make([]RankingItem, len(result.Contents))
+	copy(cloned.Contents, result.Contents)
+	return &cloned
+}
+
 // APIResponse represents the standard Pixiv API response
 type APIResponse struct {
 	Error   bool            `json:"error"`
@@ -533,6 +620,10 @@ func (c *Client) GetIllustDetail(illustID string) (*IllustDetail, error) {
 
 // GetIllustPages fetches all pages of an illustration
 func (c *Client) GetIllustPages(illustID string) ([]ImageURL, error) {
+	if urls, ok := c.getCachedPages(illustID); ok {
+		return urls, nil
+	}
+
 	url := fmt.Sprintf("%s/illust/%s/pages", ajaxURL, illustID)
 
 	resp, err := c.doRequest("GET", url)
@@ -566,6 +657,7 @@ func (c *Client) GetIllustPages(illustID string) ([]ImageURL, error) {
 		urls[i] = p.URLs
 		urls[i].Normalize()
 	}
+	c.setCachedPages(illustID, urls)
 
 	return urls, nil
 }
@@ -664,6 +756,10 @@ func (c *Client) GetRanking(mode string, page int, date string) (*RankingResult,
 	if mode == "" {
 		mode = "daily"
 	}
+	cacheKey := fmt.Sprintf("%s:%d:%s", mode, page, date)
+	if result, ok := c.getCachedRanking(cacheKey); ok {
+		return result, nil
+	}
 
 	reqURL := fmt.Sprintf("https://www.pixiv.net/ranking.php?mode=%s&p=%d&format=json", mode, page)
 	if date != "" {
@@ -684,30 +780,54 @@ func (c *Client) GetRanking(mode string, page int, date string) (*RankingResult,
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, fmt.Errorf("failed to decode response: %w", err)
 	}
+	c.setCachedRanking(cacheKey, &result)
 
 	return &result, nil
 }
 
 // ProxyImage fetches an image from Pixiv's image server
 func (c *Client) ProxyImage(imageURL string) (io.ReadCloser, string, error) {
-	req, err := http.NewRequest("GET", imageURL, nil)
+	imageResp, err := c.ProxyImageResponse(imageURL)
 	if err != nil {
 		return nil, "", err
+	}
+	return imageResp.Body, imageResp.ContentType, nil
+}
+
+// ProxyImageResponse fetches an image from Pixiv's image server with metadata.
+func (c *Client) ProxyImageResponse(imageURL string) (*ImageResponse, error) {
+	return c.ProxyImageResponseWithRange(imageURL, "")
+}
+
+// ProxyImageResponseWithRange fetches an image and forwards a Range request when provided.
+func (c *Client) ProxyImageResponseWithRange(imageURL string, rangeHeader string) (*ImageResponse, error) {
+	req, err := http.NewRequest("GET", imageURL, nil)
+	if err != nil {
+		return nil, err
 	}
 
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
 	req.Header.Set("Referer", "https://www.pixiv.net/")
+	req.Header.Set("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
+	if rangeHeader != "" {
+		req.Header.Set("Range", rangeHeader)
+	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, "", fmt.Errorf("failed to fetch image: %w", err)
+		return nil, fmt.Errorf("failed to fetch image: %w", err)
 	}
 
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
 		resp.Body.Close()
-		return nil, "", fmt.Errorf("image server returned status %d", resp.StatusCode)
+		return nil, fmt.Errorf("image server returned status %d", resp.StatusCode)
 	}
 
-	contentType := resp.Header.Get("Content-Type")
-	return resp.Body, contentType, nil
+	return &ImageResponse{
+		Body:          resp.Body,
+		ContentType:   resp.Header.Get("Content-Type"),
+		ContentLength: resp.ContentLength,
+		ContentRange:  resp.Header.Get("Content-Range"),
+		StatusCode:    resp.StatusCode,
+	}, nil
 }
