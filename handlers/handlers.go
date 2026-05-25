@@ -9,6 +9,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"image-api/pixiv"
@@ -34,6 +35,51 @@ func rankingImageURL(item pixiv.RankingItem, quality string) string {
 		return ""
 	}
 	return item.URL
+}
+
+type randomHistoryStore struct {
+	mu  sync.Mutex
+	ids map[string][]int
+}
+
+var randomHistory = randomHistoryStore{ids: make(map[string][]int)}
+
+func pickFreshRankingItem(key string, items []pixiv.RankingItem) (pixiv.RankingItem, bool) {
+	if len(items) == 0 {
+		return pixiv.RankingItem{}, false
+	}
+
+	randomHistory.mu.Lock()
+	defer randomHistory.mu.Unlock()
+
+	recentSet := make(map[int]bool)
+	for _, id := range randomHistory.ids[key] {
+		recentSet[id] = true
+	}
+
+	var fresh []pixiv.RankingItem
+	for _, item := range items {
+		id := item.GetIllustID()
+		if id != 0 && !recentSet[id] {
+			fresh = append(fresh, item)
+		}
+	}
+	if len(fresh) == 0 {
+		fresh = items
+		randomHistory.ids[key] = nil
+	}
+
+	item := fresh[randomInt(len(fresh))]
+	id := item.GetIllustID()
+	if id != 0 {
+		history := append(randomHistory.ids[key], id)
+		if len(history) > 120 {
+			history = history[len(history)-120:]
+		}
+		randomHistory.ids[key] = history
+	}
+
+	return item, true
 }
 
 var client *pixiv.Client
@@ -489,11 +535,9 @@ func RandomImage(w http.ResponseWriter, r *http.Request) {
 	// Quality parameter: original (default), regular, small, thumb, mini
 	quality := imageQualityOrDefault(r.URL.Query().Get("quality"))
 
-	// Fetch from a random page (1-10) for better variety
-	randomPage := randomInt(10) + 1
-	results, err := client.GetRanking(mode, randomPage, "")
+	// Fetch several cached ranking pages for a larger pool with fewer repeats.
+	results, err := client.GetRankingBatch(mode, 8, "")
 	if err != nil {
-		// Fallback to page 1 if random page fails
 		results, err = client.GetRanking(mode, 1, "")
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
@@ -523,9 +567,11 @@ func RandomImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Pick a random single image from the results
-	idx := randomInt(len(singleImages))
-	item := singleImages[idx]
+	item, ok := pickFreshRankingItem("image:"+mode, singleImages)
+	if !ok {
+		writeError(w, http.StatusNotFound, "No single illustrations found, try /manga for manga works")
+		return
+	}
 
 	// Fetch the actual illustration pages to get original quality URL
 	illustID := strconv.Itoa(item.GetIllustID())
@@ -639,11 +685,9 @@ func RandomManga(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Fetch from a random page (1-10) for better variety
-	randomPage := randomInt(10) + 1
-	results, err := client.GetRanking(mode, randomPage, "")
+	// Fetch several cached ranking pages for a larger pool with fewer repeats.
+	results, err := client.GetRankingBatch(mode, 8, "")
 	if err != nil {
-		// Fallback to page 1 if random page fails
 		results, err = client.GetRanking(mode, 1, "")
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
@@ -672,9 +716,11 @@ func RandomManga(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Pick a random manga from the results
-	idx := randomInt(len(mangaWorks))
-	item := mangaWorks[idx]
+	item, ok := pickFreshRankingItem("manga:"+mode, mangaWorks)
+	if !ok {
+		writeError(w, http.StatusNotFound, "No manga found, try /image for single illustrations")
+		return
+	}
 
 	// Fetch all pages of this manga
 	illustID := strconv.Itoa(item.GetIllustID())

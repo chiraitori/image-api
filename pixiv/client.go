@@ -785,6 +785,61 @@ func (c *Client) GetRanking(mode string, page int, date string) (*RankingResult,
 	return &result, nil
 }
 
+// GetRankingBatch fetches and merges several ranking pages for a larger random pool.
+func (c *Client) GetRankingBatch(mode string, pages int, date string) (*RankingResult, error) {
+	if pages <= 1 {
+		return c.GetRanking(mode, 1, date)
+	}
+
+	type pageResult struct {
+		result *RankingResult
+		err    error
+	}
+
+	results := make(chan pageResult, pages)
+	var wg sync.WaitGroup
+	for page := 1; page <= pages; page++ {
+		wg.Add(1)
+		go func(page int) {
+			defer wg.Done()
+			result, err := c.GetRanking(mode, page, date)
+			results <- pageResult{result: result, err: err}
+		}(page)
+	}
+
+	wg.Wait()
+	close(results)
+
+	merged := &RankingResult{Mode: mode, Date: date}
+	seen := make(map[int]bool)
+	var firstErr error
+	for pageResult := range results {
+		if pageResult.err != nil {
+			if firstErr == nil {
+				firstErr = pageResult.err
+			}
+			continue
+		}
+		if merged.Date == "" {
+			merged.Date = pageResult.result.Date
+		}
+		for _, item := range pageResult.result.Contents {
+			id := item.GetIllustID()
+			if id == 0 || seen[id] {
+				continue
+			}
+			seen[id] = true
+			merged.Contents = append(merged.Contents, item)
+		}
+	}
+
+	if len(merged.Contents) == 0 && firstErr != nil {
+		return nil, firstErr
+	}
+
+	return merged, nil
+}
+
 // ProxyImage fetches an image from Pixiv's image server
 func (c *Client) ProxyImage(imageURL string) (io.ReadCloser, string, error) {
 	imageResp, err := c.ProxyImageResponse(imageURL)
