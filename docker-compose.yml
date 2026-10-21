@@ -21,7 +21,6 @@ services:
       - BLOCK_R18=${BLOCK_R18:-false}
     volumes:
       - tokens-data:/app/data
-      - ./paperback-extensions/bundles:/app/paperback-extensions/bundles:ro
     depends_on:
       - redis
       - minio
