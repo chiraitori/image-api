@@ -288,8 +288,10 @@ func (p *RandomPool) PurgeLowResAndPortrait(ctx context.Context) (int, error) {
 	return purged, nil
 }
 
-// GetRandomImage retrieves a random illustration from the local S3 pool
-func (p *RandomPool) GetRandomImage(ctx context.Context, allowR18, blockR18 bool, aspect string) (io.ReadCloser, *PoolItemMeta, error) {
+// GetRandomImage retrieves a random illustration from the local S3 pool.
+// If clientIP is provided, tracks views per IP in 24 hours. If an image is randomized
+// 3 or more times in 1 day for that IP, it is deleted from S3/Redis and a fresh one is served.
+func (p *RandomPool) GetRandomImage(ctx context.Context, allowR18, blockR18 bool, aspect string, clientIP string) (io.ReadCloser, *PoolItemMeta, error) {
 	if !p.IsEnabled() {
 		return nil, nil, fmt.Errorf("pool not enabled")
 	}
@@ -303,8 +305,8 @@ func (p *RandomPool) GetRandomImage(ctx context.Context, allowR18, blockR18 bool
 		setName = "random_pool:keys:all"
 	}
 
-	// Retry up to 8 times to pick a matching high-resolution item
-	for attempt := 0; attempt < 8; attempt++ {
+	// Retry up to 10 times to pick a matching high-resolution item
+	for attempt := 0; attempt < 10; attempt++ {
 		key, err := p.redisClient.SRandMember(ctx, setName).Result()
 		if err != nil || key == "" {
 			key, err = p.redisClient.SRandMember(ctx, "random_pool:keys:all").Result()
@@ -347,9 +349,52 @@ func (p *RandomPool) GetRandomImage(ctx context.Context, allowR18, blockR18 bool
 			continue
 		}
 
+		// Check 24-hour per-IP repetition limit (3 times in 1 day)
+		if clientIP != "" {
+			ipViewKey := fmt.Sprintf("random_pool:views:%s:%d", clientIP, meta.IllustID)
+			views, _ := p.redisClient.Get(ctx, ipViewKey).Int()
+			if views >= 3 {
+				// Seen 3+ times today by this IP -> Delete from S3/Redis to recycle pool with new art
+				go func(k string, sz int64) {
+					delCtx := context.Background()
+					p.s3Client.RemoveObject(delCtx, p.bucket, k, minio.RemoveObjectOptions{})
+					p.redisClient.SRem(delCtx, "random_pool:keys:all", k)
+					p.redisClient.SRem(delCtx, "random_pool:keys:safe", k)
+					p.redisClient.SRem(delCtx, "random_pool:keys:r18", k)
+					p.redisClient.Del(delCtx, "random_pool:meta:"+k)
+					p.redisClient.DecrBy(delCtx, "random_pool:total_bytes", sz)
+				}(key, meta.Size)
+
+				// Skip and pick a fresh image
+				continue
+			}
+		}
+
 		obj, err := p.s3Client.GetObject(ctx, p.bucket, key, minio.GetObjectOptions{})
 		if err != nil {
 			continue
+		}
+
+		// Record view count for this client IP with 24-hour expiration
+		if clientIP != "" {
+			ipViewKey := fmt.Sprintf("random_pool:views:%s:%d", clientIP, meta.IllustID)
+			newCount, _ := p.redisClient.Incr(ctx, ipViewKey).Result()
+			if newCount == 1 {
+				p.redisClient.Expire(ctx, ipViewKey, 24*time.Hour)
+			}
+			// If this was the 3rd time served to this IP, delete it from S3/Redis
+			// so space is freed and background crawler automatically downloads fresh art!
+			if newCount >= 3 {
+				go func(k string, sz int64) {
+					delCtx := context.Background()
+					p.s3Client.RemoveObject(delCtx, p.bucket, k, minio.RemoveObjectOptions{})
+					p.redisClient.SRem(delCtx, "random_pool:keys:all", k)
+					p.redisClient.SRem(delCtx, "random_pool:keys:safe", k)
+					p.redisClient.SRem(delCtx, "random_pool:keys:r18", k)
+					p.redisClient.Del(delCtx, "random_pool:meta:"+k)
+					p.redisClient.DecrBy(delCtx, "random_pool:total_bytes", sz)
+				}(key, meta.Size)
+			}
 		}
 
 		return obj, &meta, nil

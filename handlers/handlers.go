@@ -169,6 +169,30 @@ func checkAdminAuth(r *http.Request) bool {
 	return false
 }
 
+// getClientIP extracts real client IP behind reverse proxies
+func getClientIP(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		parts := strings.Split(xff, ",")
+		if len(parts) > 0 {
+			ip := strings.TrimSpace(parts[0])
+			if ip != "" {
+				return ip
+			}
+		}
+	}
+	if xrip := r.Header.Get("X-Real-IP"); xrip != "" {
+		return strings.TrimSpace(xrip)
+	}
+	if cfip := r.Header.Get("CF-Connecting-IP"); cfip != "" {
+		return strings.TrimSpace(cfip)
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
 // Response helpers
 type APIError struct {
 	Error   bool   `json:"error"`
@@ -683,8 +707,9 @@ func RandomImage(w http.ResponseWriter, r *http.Request) {
 
 	// 1. Check local 5GB S3 pool first if enabled (instant response, zero Pixiv dependency)
 	aspectParam := strings.ToLower(r.URL.Query().Get("aspect"))
+	clientIP := getClientIP(r)
 	if storage.Pool.IsEnabled() && rawMode == "" {
-		obj, meta, err := storage.Pool.GetRandomImage(r.Context(), allowR18, blockR18, aspectParam)
+		obj, meta, err := storage.Pool.GetRandomImage(r.Context(), allowR18, blockR18, aspectParam, clientIP)
 		if err == nil && obj != nil {
 			defer obj.Close()
 			w.Header().Set("Content-Type", meta.ContentType)
