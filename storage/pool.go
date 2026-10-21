@@ -5,6 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"image"
+	_ "image/gif"
+	"image/jpeg"
+	_ "image/png"
 	"io"
 	"log"
 	"math/rand"
@@ -18,6 +22,7 @@ import (
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/redis/go-redis/v9"
+	"golang.org/x/image/draw"
 	"image-api/pixiv"
 )
 
@@ -166,6 +171,57 @@ func GetHighResCandidateURLs(imageURL string) []string {
 		baseOrig + ".png",
 		masterURL,
 	}
+}
+
+// OptimizeImageForCache resizes large images to max dimension (e.g. 2048 for 2K)
+// and compresses with JPEG quality ~82 to optimize S3 storage usage.
+func OptimizeImageForCache(rawBytes []byte, maxDim int, quality int) ([]byte, int, int, string, error) {
+	if maxDim <= 0 {
+		maxDim = 2048 // 2K max dimension
+	}
+	if quality <= 0 {
+		quality = 82
+	}
+
+	img, _, err := image.Decode(bytes.NewReader(rawBytes))
+	if err != nil {
+		return rawBytes, 0, 0, "image/jpeg", nil
+	}
+
+	bounds := img.Bounds()
+	w := bounds.Dx()
+	h := bounds.Dy()
+
+	targetW := w
+	targetH := h
+
+	// Scale down if exceeds maxDim
+	if w > maxDim || h > maxDim {
+		if w >= h {
+			targetW = maxDim
+			targetH = int(float64(h) * float64(maxDim) / float64(w))
+		} else {
+			targetH = maxDim
+			targetW = int(float64(w) * float64(maxDim) / float64(h))
+		}
+	}
+
+	var dst image.Image
+	if targetW != w || targetH != h {
+		dstImg := image.NewRGBA(image.Rect(0, 0, targetW, targetH))
+		draw.BiLinear.Scale(dstImg, dstImg.Bounds(), img, bounds, draw.Over, nil)
+		dst = dstImg
+	} else {
+		dst = img
+	}
+
+	var buf bytes.Buffer
+	err = jpeg.Encode(&buf, dst, &jpeg.Options{Quality: quality})
+	if err != nil {
+		return rawBytes, w, h, "image/jpeg", nil
+	}
+
+	return buf.Bytes(), targetW, targetH, "image/jpeg", nil
 }
 
 // IsEnabled returns true if pool is operational
@@ -391,27 +447,31 @@ func (p *RandomPool) crawlBatch() {
 				continue
 			}
 
-			imgBytes, errRead := io.ReadAll(body)
+			rawBytes, errRead := io.ReadAll(body)
 			body.Close()
-			// Must be at least 150KB to guarantee crisp 1080p/2K quality (no 480px thumbnails)
-			if errRead != nil || len(imgBytes) < 150*1024 {
+			if errRead != nil || len(rawBytes) < 50*1024 {
 				continue
 			}
 
-			ext := ".jpg"
-			if strings.Contains(contentType, "png") {
-				ext = ".png"
-			} else if strings.Contains(contentType, "gif") {
-				ext = ".gif"
-			} else if strings.Contains(contentType, "webp") {
-				ext = ".webp"
+			// Optimize & compress down for S3 cache:
+			// Resizes 4K/oversized images to max 2048px (2K) and encodes with JPEG quality 82.
+			// Slashes file size down to ~350KB-600KB so the 5GB S3 cache holds 10,000+ images!
+			finalBytes, optW, optH, finalContentType, errOpt := OptimizeImageForCache(rawBytes, 2048, 82)
+			if errOpt != nil || len(finalBytes) == 0 {
+				finalBytes = rawBytes
+				finalContentType = contentType
+			} else {
+				if optW > 0 && optH > 0 {
+					w, h = int64(optW), int64(optH)
+					aspectRatio = float64(w) / float64(h)
+				}
 			}
 
-			key := fmt.Sprintf("%d_%d%s", illustID, rand.Intn(10000), ext)
+			key := fmt.Sprintf("%d_%d.jpg", illustID, rand.Intn(10000))
 
 			// Store in S3
-			_, errPut := p.s3Client.PutObject(ctx, p.bucket, key, bytes.NewReader(imgBytes), int64(len(imgBytes)), minio.PutObjectOptions{
-				ContentType: contentType,
+			_, errPut := p.s3Client.PutObject(ctx, p.bucket, key, bytes.NewReader(finalBytes), int64(len(finalBytes)), minio.PutObjectOptions{
+				ContentType: finalContentType,
 			})
 			if errPut != nil {
 				log.Printf("[Pool] Error saving to S3: %v", errPut)
@@ -424,8 +484,8 @@ func (p *RandomPool) crawlBatch() {
 				IllustID:    illustID,
 				Title:       item.Title,
 				Author:      item.UserName,
-				ContentType: contentType,
-				Size:        int64(len(imgBytes)),
+				ContentType: finalContentType,
+				Size:        int64(len(finalBytes)),
 				Width:       int(w),
 				Height:      int(h),
 				AspectRatio: aspectRatio,
@@ -448,10 +508,10 @@ func (p *RandomPool) crawlBatch() {
 				pipe.SAdd(ctx, "random_pool:keys:portrait_9_16", key)
 			}
 			pipe.Set(ctx, "random_pool:meta:"+key, string(metaJSON), 0)
-			pipe.IncrBy(ctx, "random_pool:total_bytes", int64(len(imgBytes)))
+			pipe.IncrBy(ctx, "random_pool:total_bytes", int64(len(finalBytes)))
 			_, _ = pipe.Exec(ctx)
 
-			totalBytes += int64(len(imgBytes))
+			totalBytes += int64(len(finalBytes))
 			time.Sleep(300 * time.Millisecond) // Polite crawling throttle
 		}
 	}
