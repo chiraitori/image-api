@@ -250,8 +250,8 @@ func (p *RandomPool) PurgeLowResAndPortrait(ctx context.Context) (int, error) {
 			if err := json.Unmarshal([]byte(metaData), &meta); err != nil {
 				shouldDelete = true
 			} else {
-				// Purge if vertical portrait / 9:16 (< 0.95 or > 2.6) or low-res (< 150KB)
-				if meta.AspectRatio < 0.95 || meta.AspectRatio > 2.6 || meta.Size < 150*1024 {
+				// Purge if R-18, vertical portrait / 9:16 (< 0.95 or > 2.6), or low-res (< 150KB)
+				if meta.IsR18 || meta.AspectRatio < 0.95 || meta.AspectRatio > 2.6 || meta.Size < 150*1024 {
 					shouldDelete = true
 				}
 			}
@@ -327,6 +327,14 @@ func (p *RandomPool) GetRandomImage(ctx context.Context, allowR18, blockR18 bool
 		if err := json.Unmarshal([]byte(metaData), &meta); err != nil {
 			p.redisClient.SRem(ctx, setName, key)
 			p.redisClient.SRem(ctx, "random_pool:keys:all", key)
+			continue
+		}
+
+		// Strictly block R-18 when in safe mode
+		if blockR18 && meta.IsR18 {
+			p.redisClient.SRem(ctx, setName, key)
+			p.redisClient.SRem(ctx, "random_pool:keys:all", key)
+			p.redisClient.SRem(ctx, "random_pool:keys:safe", key)
 			continue
 		}
 
@@ -425,6 +433,17 @@ type candidateArt struct {
 
 func (p *RandomPool) saveCandidate(ctx context.Context, item candidateArt, totalBytes *int64) bool {
 	if *totalBytes >= p.targetBytes || item.IllustID == 0 || item.URL == "" {
+		return false
+	}
+
+	// Strictly SFW only: reject any R-18, NSFW, or adult titled/tagged artwork
+	if item.IsR18 {
+		return false
+	}
+	titleLower := strings.ToLower(item.Title)
+	if strings.Contains(titleLower, "r-18") || strings.Contains(titleLower, "r18") ||
+		strings.Contains(titleLower, "18禁") || strings.Contains(titleLower, "nsfw") ||
+		strings.Contains(titleLower, "r-18g") || strings.Contains(titleLower, "r18g") {
 		return false
 	}
 
@@ -585,7 +604,8 @@ func (p *RandomPool) crawlBatch() {
 			if totalBytes >= p.targetBytes {
 				break
 			}
-			res, err := p.pixivClient.SearchIllusts(tag, page)
+			// Search with mode=safe at the Pixiv API level
+			res, err := p.pixivClient.SearchIllustsWithMode(tag, page, "safe")
 			if err != nil || res == nil || len(res.Illusts) == 0 {
 				continue
 			}
@@ -593,8 +613,8 @@ func (p *RandomPool) crawlBatch() {
 				if totalBytes >= p.targetBytes {
 					break
 				}
-				if illust.PageCount > 1 {
-					continue // single-page illustrations only
+				if illust.PageCount > 1 || illust.IsR18() {
+					continue // single-page SFW illustrations only
 				}
 				id, _ := strconv.Atoi(illust.ID)
 				if id == 0 {
@@ -613,11 +633,8 @@ func (p *RandomPool) crawlBatch() {
 		}
 	}
 
-	// 2. Crawl trending daily, weekly, monthly rankings
+	// 2. Crawl trending daily, weekly, monthly rankings (strictly SFW rankings only)
 	modes := []string{"daily", "weekly", "monthly", "original", "daily_ai"}
-	if p.pixivClient.IsLoggedIn() || p.pixivClient.GetCookie() != "" || p.pixivClient.HasTokens() {
-		modes = append(modes, "daily_r18", "weekly_r18")
-	}
 
 	for _, mode := range modes {
 		if totalBytes >= p.targetBytes {
@@ -634,7 +651,8 @@ func (p *RandomPool) crawlBatch() {
 				break
 			}
 
-			if item.GetPageCount() > 1 || (item.IllustType != "0" && item.IllustType != "") {
+			// Single SFW illustrations only
+			if item.GetPageCount() > 1 || (item.IllustType != "0" && item.IllustType != "") || item.IsR18() {
 				continue
 			}
 
@@ -645,7 +663,6 @@ func (p *RandomPool) crawlBatch() {
 
 			w, _ := item.Width.Int64()
 			h, _ := item.Height.Int64()
-			isR18 := item.IsR18() || strings.Contains(mode, "r18")
 
 			p.saveCandidate(ctx, candidateArt{
 				IllustID: illustID,
@@ -654,7 +671,7 @@ func (p *RandomPool) crawlBatch() {
 				URL:      item.URL,
 				Width:    w,
 				Height:   h,
-				IsR18:    isR18,
+				IsR18:    false,
 			}, &totalBytes)
 		}
 	}

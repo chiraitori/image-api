@@ -630,14 +630,32 @@ type SearchResult struct {
 
 // IllustBrief represents brief illustration info
 type IllustBrief struct {
-	ID        string `json:"id"`
-	Title     string `json:"title"`
-	UserID    string `json:"userId"`
-	UserName  string `json:"userName"`
-	Thumbnail string `json:"url"`
-	Width     int    `json:"width"`
-	Height    int    `json:"height"`
-	PageCount int    `json:"pageCount"`
+	ID        string   `json:"id"`
+	Title     string   `json:"title"`
+	UserID    string   `json:"userId"`
+	UserName  string   `json:"userName"`
+	Thumbnail string   `json:"url"`
+	Width     int      `json:"width"`
+	Height    int      `json:"height"`
+	PageCount int      `json:"pageCount"`
+	XRestrict int      `json:"xRestrict"`
+	Tags      []string `json:"tags"`
+}
+
+// IsR18 reports whether the search result is R-18/NSFW
+func (b IllustBrief) IsR18() bool {
+	if b.XRestrict > 0 {
+		return true
+	}
+	for _, tag := range b.Tags {
+		t := strings.ToLower(strings.TrimSpace(tag))
+		if t == "r-18" || t == "r-18g" || t == "r18" || t == "r18g" || t == "18禁" {
+			return true
+		}
+	}
+	title := strings.ToLower(b.Title)
+	return strings.Contains(title, "r-18") || strings.Contains(title, "r18") ||
+		strings.Contains(title, "18禁") || strings.Contains(title, "nsfw")
 }
 
 // RankingResult represents ranking results
@@ -831,11 +849,19 @@ func (c *Client) GetIllustPages(illustID string) ([]ImageURL, error) {
 	return urls, nil
 }
 
-// SearchIllusts searches for illustrations
+// SearchIllusts searches for illustrations (defaulting to safe/SFW mode)
 func (c *Client) SearchIllusts(keyword string, page int) (*SearchResult, error) {
+	return c.SearchIllustsWithMode(keyword, page, "safe")
+}
+
+// SearchIllustsWithMode searches for illustrations with specific mode (safe, r18, all)
+func (c *Client) SearchIllustsWithMode(keyword string, page int, mode string) (*SearchResult, error) {
+	if mode == "" {
+		mode = "safe"
+	}
 	escapedKeyword := url.QueryEscape(keyword)
-	reqURL := fmt.Sprintf("%s/search/artworks/%s?word=%s&order=date_d&mode=all&p=%d&s_mode=s_tag&type=all",
-		ajaxURL, escapedKeyword, escapedKeyword, page)
+	reqURL := fmt.Sprintf("%s/search/artworks/%s?word=%s&order=date_d&mode=%s&p=%d&s_mode=s_tag&type=all",
+		ajaxURL, escapedKeyword, escapedKeyword, mode, page)
 
 	resp, err := c.doRequest("GET", reqURL)
 	if err != nil {
