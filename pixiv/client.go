@@ -630,32 +630,36 @@ type SearchResult struct {
 
 // IllustBrief represents brief illustration info
 type IllustBrief struct {
-	ID        string   `json:"id"`
-	Title     string   `json:"title"`
-	UserID    string   `json:"userId"`
-	UserName  string   `json:"userName"`
-	Thumbnail string   `json:"url"`
-	Width     int      `json:"width"`
-	Height    int      `json:"height"`
-	PageCount int      `json:"pageCount"`
-	XRestrict int      `json:"xRestrict"`
-	Tags      []string `json:"tags"`
+	ID          string   `json:"id"`
+	Title       string   `json:"title"`
+	UserID      string   `json:"userId"`
+	UserName    string   `json:"userName"`
+	Thumbnail   string   `json:"url"`
+	Width       int      `json:"width"`
+	Height      int      `json:"height"`
+	PageCount   int      `json:"pageCount"`
+	Tags        []string `json:"tags"`
+	XRestrict   int      `json:"xRestrict"`
+	SanityLevel int      `json:"sl"`
 }
 
-// IsR18 reports whether the search result is R-18/NSFW
-func (b IllustBrief) IsR18() bool {
-	if b.XRestrict > 0 {
+// IsR18 reports whether the search brief is R-18 or NSFW
+func (i IllustBrief) IsR18() bool {
+	if i.XRestrict > 0 || i.SanityLevel > 2 {
 		return true
 	}
-	for _, tag := range b.Tags {
+	for _, tag := range i.Tags {
 		t := strings.ToLower(strings.TrimSpace(tag))
-		if t == "r-18" || t == "r-18g" || t == "r18" || t == "r18g" || t == "18禁" {
+		if t == "r-18" || t == "r-18g" || t == "r18" || t == "r18g" || t == "nsfw" ||
+			strings.Contains(t, "r-18") || strings.Contains(t, "r18") {
 			return true
 		}
 	}
-	title := strings.ToLower(b.Title)
-	return strings.Contains(title, "r-18") || strings.Contains(title, "r18") ||
-		strings.Contains(title, "18禁") || strings.Contains(title, "nsfw")
+	title := strings.ToLower(i.Title)
+	if strings.Contains(title, "r-18") || strings.Contains(title, "r18") || strings.Contains(title, "nsfw") {
+		return true
+	}
+	return false
 }
 
 // RankingResult represents ranking results
@@ -665,31 +669,41 @@ type RankingResult struct {
 	Date     string        `json:"date"`
 }
 
-// RankingItem represents a single ranking item
-type RankingItem struct {
-	IllustID        json.Number `json:"illust_id"`
-	Title           string      `json:"title"`
-	UserID          json.Number `json:"user_id"`
-	UserName        string      `json:"user_name"`
-	Rank            json.Number `json:"rank"`
-	URL             string      `json:"url"`
-	Width           json.Number `json:"width"`
-	Height          json.Number `json:"height"`
-	IllustType      string      `json:"illust_type"`
-	IllustPageCount json.Number `json:"illust_page_count"`
-	Tags            []string    `json:"tags,omitempty"`
+type IllustContentType struct {
+	Sexual int `json:"sexual"`
 }
 
-// IsR18 reports whether the ranking item is explicitly tagged or titled as R-18/NSFW
+// RankingItem represents a single ranking item
+type RankingItem struct {
+	IllustID          json.Number       `json:"illust_id"`
+	Title             string            `json:"title"`
+	UserID            json.Number       `json:"user_id"`
+	UserName          string            `json:"user_name"`
+	Rank              json.Number       `json:"rank"`
+	URL               string            `json:"url"`
+	Width             json.Number       `json:"width"`
+	Height            json.Number       `json:"height"`
+	IllustType        string            `json:"illust_type"`
+	IllustPageCount   json.Number       `json:"illust_page_count"`
+	Tags              []string          `json:"tags,omitempty"`
+	IllustContentType IllustContentType `json:"illust_content_type"`
+	XRestrict         int               `json:"x_restrict"`
+}
+
+// IsR18 reports whether the ranking item is explicitly tagged, rated, or titled as R-18/NSFW
 func (r RankingItem) IsR18() bool {
+	if r.IllustContentType.Sexual > 0 || r.XRestrict > 0 {
+		return true
+	}
 	for _, tag := range r.Tags {
 		t := strings.ToLower(strings.TrimSpace(tag))
-		if t == "r-18" || t == "r-18g" || t == "r18" || t == "r18g" {
+		if t == "r-18" || t == "r-18g" || t == "r18" || t == "r18g" || t == "nsfw" ||
+			strings.Contains(t, "r-18") || strings.Contains(t, "r18") {
 			return true
 		}
 	}
 	title := strings.ToLower(r.Title)
-	if strings.Contains(title, "r-18") || strings.Contains(title, "r18") {
+	if strings.Contains(title, "r-18") || strings.Contains(title, "r18") || strings.Contains(title, "nsfw") {
 		return true
 	}
 	return false
@@ -849,12 +863,12 @@ func (c *Client) GetIllustPages(illustID string) ([]ImageURL, error) {
 	return urls, nil
 }
 
-// SearchIllusts searches for illustrations (defaulting to safe/SFW mode)
+// SearchIllusts searches for all-ages illustrations by default
 func (c *Client) SearchIllusts(keyword string, page int) (*SearchResult, error) {
 	return c.SearchIllustsWithMode(keyword, page, "safe")
 }
 
-// SearchIllustsWithMode searches for illustrations with specific mode (safe, r18, all)
+// SearchIllustsWithMode searches for illustrations with specific safety mode ("safe", "r18", "all")
 func (c *Client) SearchIllustsWithMode(keyword string, page int, mode string) (*SearchResult, error) {
 	if mode == "" {
 		mode = "safe"
