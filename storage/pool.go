@@ -250,8 +250,8 @@ func (p *RandomPool) PurgeLowResAndPortrait(ctx context.Context) (int, error) {
 			if err := json.Unmarshal([]byte(metaData), &meta); err != nil {
 				shouldDelete = true
 			} else {
-				// Purge if not 16:9 / 4:3 widescreen (ratio < 1.25 or > 2.6) or low-res (< 150KB)
-				if meta.AspectRatio < 1.25 || meta.AspectRatio > 2.6 || meta.Size < 150*1024 {
+				// Purge if vertical portrait / 9:16 (< 0.95 or > 2.6) or low-res (< 150KB)
+				if meta.AspectRatio < 0.95 || meta.AspectRatio > 2.6 || meta.Size < 150*1024 {
 					shouldDelete = true
 				}
 			}
@@ -330,8 +330,8 @@ func (p *RandomPool) GetRandomImage(ctx context.Context, allowR18, blockR18 bool
 			continue
 		}
 
-		// Strictly require 16:9 / 4:3 widescreen landscape (ratio 1.25 - 2.6) by default
-		if (aspect == "" || aspect == "landscape") && (meta.AspectRatio < 1.25 || meta.AspectRatio > 2.6) {
+		// Strictly require 1:1 square, 4:3, or 16:9 widescreen (ratio 0.95 - 2.6), rejecting 9:16
+		if (aspect == "" || aspect == "landscape") && (meta.AspectRatio < 0.95 || meta.AspectRatio > 2.6) {
 			p.redisClient.SRem(ctx, setName, key)
 			p.redisClient.SRem(ctx, "random_pool:keys:all", key)
 			p.redisClient.SRem(ctx, "random_pool:keys:safe", key)
@@ -434,9 +434,9 @@ func (p *RandomPool) saveCandidate(ctx context.Context, item candidateArt, total
 	}
 	aspectRatio := float64(w) / float64(h)
 
-	// Strict 16:9 / 4:3 widescreen policy: ratio between 1.25 and 2.6
-	// Rejects 1:1 square (1.0), vertical portraits (< 1.0), and 9:16 (0.56)
-	if aspectRatio < 1.25 || aspectRatio > 2.6 {
+	// Allow 1:1 square, 4:3, and 16:9 widescreen policy: ratio between 0.95 and 2.6
+	// Rejects vertical portraits (< 0.95) and 9:16 phone wallpapers (0.56)
+	if aspectRatio < 0.95 || aspectRatio > 2.6 {
 		return false
 	}
 

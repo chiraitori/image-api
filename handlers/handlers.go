@@ -760,15 +760,15 @@ func RandomImage(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// Enforce aspect ratio: default strictly enforces 16:9 and 4:3 widescreen (1.25 <= aspectRatio <= 2.6)
+		// Enforce aspect ratio: default accepts 1:1 square, 4:3, and 16:9 widescreen (0.95 <= aspectRatio <= 2.6)
 		w, _ := item.Width.Int64()
 		h, _ := item.Height.Int64()
 		if w > 0 && h > 0 {
 			aspectRatio := float64(w) / float64(h)
-			if aspectParam != "portrait" && aspectParam != "all" && (aspectRatio < 1.25 || aspectRatio > 2.6) {
+			if aspectParam != "portrait" && aspectParam != "all" && (aspectRatio < 0.95 || aspectRatio > 2.6) {
 				continue
 			}
-			if aspectParam == "portrait" && aspectRatio >= 1.0 {
+			if aspectParam == "portrait" && aspectRatio >= 0.95 {
 				continue
 			}
 		}
