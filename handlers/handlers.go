@@ -29,7 +29,7 @@ func randomInt(max int) int {
 
 func imageQualityOrDefault(quality string) string {
 	if quality == "" {
-		return "regular"
+		return "original"
 	}
 	return quality
 }
@@ -682,8 +682,9 @@ func RandomImage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 1. Check local 5GB S3 pool first if enabled (instant response, zero Pixiv dependency)
+	aspectParam := strings.ToLower(r.URL.Query().Get("aspect"))
 	if storage.Pool.IsEnabled() && rawMode == "" {
-		obj, meta, err := storage.Pool.GetRandomImage(r.Context(), allowR18, blockR18)
+		obj, meta, err := storage.Pool.GetRandomImage(r.Context(), allowR18, blockR18, aspectParam)
 		if err == nil && obj != nil {
 			defer obj.Close()
 			w.Header().Set("Content-Type", meta.ContentType)
@@ -700,7 +701,7 @@ func RandomImage(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Quality parameter: original (default), regular, small, thumb, mini
+	// Quality parameter: original (default: 1080p/2K/original), regular, small, thumb, mini
 	quality := imageQualityOrDefault(r.URL.Query().Get("quality"))
 
 	// Fetch cached ranking batch (2 pages is 100 illustrations, avoiding Pixiv rate limit)
@@ -718,7 +719,7 @@ func RandomImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Filter to only single-page illustrations (not manga) and enforce R-18 / safe filtering
+	// Filter to only single-page illustrations (not manga), enforce aspect ratio, and enforce R-18 / safe filtering
 	var singleImages []pixiv.RankingItem
 	for _, item := range results.Contents {
 		isIllustration := item.IllustType == "0" || item.IllustType == ""
@@ -730,6 +731,19 @@ func RandomImage(w http.ResponseWriter, r *http.Request) {
 		// When blocking R-18 / NSFW, filter out any tagged or titled R-18 items
 		if blockR18 || (!allowR18 && !strings.Contains(mode, "r18")) {
 			if item.IsR18() {
+				continue
+			}
+		}
+
+		// Enforce aspect ratio: default strictly blocks 9:16 and vertical phone wallpapers (aspectRatio >= 0.95)
+		w, _ := item.Width.Int64()
+		h, _ := item.Height.Int64()
+		if w > 0 && h > 0 {
+			aspectRatio := float64(w) / float64(h)
+			if aspectParam != "portrait" && aspectParam != "all" && aspectRatio < 0.95 {
+				continue
+			}
+			if aspectParam == "portrait" && aspectRatio >= 0.95 {
 				continue
 			}
 		}
@@ -752,68 +766,37 @@ func RandomImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Fetch the actual illustration pages to get original quality URL
+	// Fetch high-resolution image (1080p, 2K, or original): try pages API first
 	illustID := strconv.Itoa(item.GetIllustID())
-	imageURL := rankingImageURL(item, quality)
-	if imageURL == "" {
-		pages, err := client.GetIllustPages(illustID)
-		if err == nil && len(pages) > 0 {
-			// Use the pages API for best quality
-			imageURL = pages[0].URLForQuality(quality)
+	var body io.ReadCloser
+	var contentType string
+	var errProxy error
+
+	pages, err := client.GetIllustPages(illustID)
+	if err == nil && len(pages) > 0 {
+		targetQuality := quality
+		if targetQuality == "" {
+			targetQuality = "original"
+		}
+		imageURL := pages[0].URLForQuality(targetQuality)
+		if imageURL != "" {
+			body, contentType, errProxy = client.ProxyImage(imageURL)
 		}
 	}
 
-	// Fallback: try to construct original URL from thumbnail
-	if imageURL == "" {
-		imageURL = item.URL
-		// Remove size constraints and convert to original
-		imageURL = strings.Replace(imageURL, "c/240x480/", "", 1)
-		imageURL = strings.Replace(imageURL, "c/240x480_80_a2/", "", 1)
-		imageURL = strings.Replace(imageURL, "c/128x128/", "", 1)
-		imageURL = strings.Replace(imageURL, "c/540x540_70/", "", 1)
-		imageURL = strings.Replace(imageURL, "custom-thumb/", "", 1)
-		imageURL = strings.Replace(imageURL, "_custom1200", "", 1)
-		imageURL = strings.Replace(imageURL, "_master1200", "", 1)
-		imageURL = strings.Replace(imageURL, "_square1200", "", 1)
-		imageURL = strings.Replace(imageURL, "img-master", "img-original", 1)
-
-		// Try common extensions for original
-		if !strings.Contains(imageURL, ".") {
-			imageURL += ".jpg"
-		}
-	}
-
-	if imageURL == "" {
-		writeError(w, http.StatusNotFound, "Image URL not found")
-		return
-	}
-
-	// Try to fetch the image, with fallbacks for different extensions
-	body, contentType, err := client.ProxyImage(imageURL)
-	if err != nil && strings.Contains(imageURL, "img-original") {
-		// Try different extensions: png, jpg, gif
-		extensions := []string{".png", ".jpg", ".jpeg", ".gif"}
-		baseURL := imageURL
-		for _, ext := range []string{".png", ".jpg", ".jpeg", ".gif"} {
-			baseURL = strings.TrimSuffix(baseURL, ext)
-		}
-
-		for _, ext := range extensions {
-			tryURL := baseURL + ext
-			body, contentType, err = client.ProxyImage(tryURL)
-			if err == nil {
+	// Fallback to candidate high-res URLs constructed from item.URL (Original 2K/4K or Master 1200p)
+	if body == nil {
+		for _, tryURL := range storage.GetHighResCandidateURLs(item.URL) {
+			body, contentType, errProxy = client.ProxyImage(tryURL)
+			if errProxy == nil && body != nil {
 				break
 			}
 		}
 	}
 
-	// Final fallback to thumbnail
-	if err != nil {
-		body, contentType, err = client.ProxyImage(item.URL)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
+	if body == nil {
+		writeError(w, http.StatusNotFound, "Failed to fetch high-resolution image")
+		return
 	}
 	defer body.Close()
 
@@ -858,25 +841,6 @@ func RandomManga(w http.ResponseWriter, r *http.Request) {
 	if allowR18 && !client.IsLoggedIn() && client.GetCookie() == "" && !client.HasTokens() {
 		writeError(w, http.StatusUnauthorized, "Pixiv session cookie (PIXIV_COOKIE) is required to access R-18/NSFW content")
 		return
-	}
-
-	// 1. Check local 5GB S3 pool first if enabled (instant response, zero Pixiv dependency)
-	if storage.Pool.IsEnabled() && rawMode == "" {
-		obj, meta, err := storage.Pool.GetRandomImage(r.Context(), allowR18, blockR18)
-		if err == nil && obj != nil {
-			defer obj.Close()
-			w.Header().Set("Content-Type", meta.ContentType)
-			w.Header().Set("Access-Control-Allow-Origin", "*")
-			w.Header().Set("Cache-Control", "no-cache")
-			w.Header().Set("X-Illust-ID", strconv.Itoa(meta.IllustID))
-			w.Header().Set("X-Illust-Title", meta.Title)
-			w.Header().Set("X-Illust-Author", meta.Author)
-			w.Header().Set("X-Pool-Cached", "true")
-			w.Header().Set("X-Aspect-Ratio", fmt.Sprintf("%.2f", meta.AspectRatio))
-			w.Header().Set("X-Is-R18", strconv.FormatBool(meta.IsR18))
-			io.Copy(w, obj)
-			return
-		}
 	}
 
 	// Quality parameter: original (default), regular, small, thumb, mini

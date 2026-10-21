@@ -9,6 +9,7 @@ import (
 	"log"
 	"math/rand"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -128,8 +129,43 @@ func InitPool(pixivCl *pixiv.Client) {
 
 	log.Printf("[Pool] Initialized S3 (%s) and Redis (%s) random image pool (target: %d GB)", s3Endpoint, redisAddr, targetGB)
 
-	// Start background crawler to maintain the ~5GB cache
-	go Pool.startCrawler()
+	// Clean out any old low-res or 9:16 images, then run crawler
+	go func() {
+		Pool.PurgeLowResAndPortrait(context.Background())
+		Pool.startCrawler()
+	}()
+}
+
+var rePixivCrop = regexp.MustCompile(`/c/[^/]+/`)
+
+// GetHighResCandidateURLs transforms any thumbnail URL into full 1080p/2K/original Pixiv URLs
+func GetHighResCandidateURLs(imageURL string) []string {
+	if imageURL == "" {
+		return nil
+	}
+	// Strip crop path (e.g. /c/480x960/, /c/240x480/, /custom-thumb/)
+	masterURL := rePixivCrop.ReplaceAllString(imageURL, "/")
+	masterURL = strings.Replace(masterURL, "/custom-thumb/", "/", 1)
+
+	// Build original URL candidate by stripping _master1200 and changing path to /img-original/
+	baseOrig := masterURL
+	baseOrig = strings.Replace(baseOrig, "_master1200", "", 1)
+	baseOrig = strings.Replace(baseOrig, "_custom1200", "", 1)
+	baseOrig = strings.Replace(baseOrig, "_square1200", "", 1)
+	baseOrig = strings.Replace(baseOrig, "/img-master/", "/img-original/", 1)
+
+	for _, ext := range []string{".jpg", ".png", ".jpeg", ".gif", ".webp"} {
+		baseOrig = strings.TrimSuffix(baseOrig, ext)
+	}
+
+	// 1. Try full original 2K/4K JPG
+	// 2. Try full original 2K/4K PNG
+	// 3. Fallback to 1200p Master (crisp ~1080p/2K quality, never 480px thumbnail)
+	return []string{
+		baseOrig + ".jpg",
+		baseOrig + ".png",
+		masterURL,
+	}
 }
 
 // IsEnabled returns true if pool is operational
@@ -137,8 +173,67 @@ func (p *RandomPool) IsEnabled() bool {
 	return p != nil && p.enabled
 }
 
+// PurgeLowResAndPortrait cleans out any remaining 9:16 portrait or <150KB thumbnail images
+func (p *RandomPool) PurgeLowResAndPortrait(ctx context.Context) (int, error) {
+	if !p.IsEnabled() {
+		return 0, nil
+	}
+	keys, err := p.redisClient.SMembers(ctx, "random_pool:keys:all").Result()
+	if err != nil {
+		return 0, err
+	}
+
+	purged := 0
+	for _, key := range keys {
+		metaData, err := p.redisClient.Get(ctx, "random_pool:meta:"+key).Result()
+		shouldDelete := false
+		if err != nil || metaData == "" {
+			shouldDelete = true
+		} else {
+			var meta PoolItemMeta
+			if err := json.Unmarshal([]byte(metaData), &meta); err != nil {
+				shouldDelete = true
+			} else {
+				// Purge if vertical/9:16 (< 0.95) or low-res (< 150KB)
+				if meta.AspectRatio < 0.95 || meta.Size < 150*1024 {
+					shouldDelete = true
+				}
+			}
+		}
+
+		if shouldDelete {
+			p.s3Client.RemoveObject(ctx, p.bucket, key, minio.RemoveObjectOptions{})
+			p.redisClient.SRem(ctx, "random_pool:keys:all", key)
+			p.redisClient.SRem(ctx, "random_pool:keys:safe", key)
+			p.redisClient.SRem(ctx, "random_pool:keys:r18", key)
+			p.redisClient.SRem(ctx, "random_pool:keys:portrait_9_16", key)
+			p.redisClient.Del(ctx, "random_pool:meta:"+key)
+			purged++
+		}
+	}
+
+	// Recalculate total_bytes
+	var newTotal int64
+	remainingKeys, _ := p.redisClient.SMembers(ctx, "random_pool:keys:all").Result()
+	for _, key := range remainingKeys {
+		if metaData, err := p.redisClient.Get(ctx, "random_pool:meta:"+key).Result(); err == nil {
+			var meta PoolItemMeta
+			if err := json.Unmarshal([]byte(metaData), &meta); err == nil {
+				newTotal += meta.Size
+			}
+		}
+	}
+	p.redisClient.Set(ctx, "random_pool:total_bytes", newTotal, 0)
+
+	if purged > 0 {
+		log.Printf("[Pool] Purged %d low-res / 9:16 portrait images. Remaining high-res images: %d (%d MB)",
+			purged, len(remainingKeys), newTotal/(1024*1024))
+	}
+	return purged, nil
+}
+
 // GetRandomImage retrieves a random illustration from the local S3 pool
-func (p *RandomPool) GetRandomImage(ctx context.Context, allowR18, blockR18 bool) (io.ReadCloser, *PoolItemMeta, error) {
+func (p *RandomPool) GetRandomImage(ctx context.Context, allowR18, blockR18 bool, aspect string) (io.ReadCloser, *PoolItemMeta, error) {
 	if !p.IsEnabled() {
 		return nil, nil, fmt.Errorf("pool not enabled")
 	}
@@ -152,32 +247,59 @@ func (p *RandomPool) GetRandomImage(ctx context.Context, allowR18, blockR18 bool
 		setName = "random_pool:keys:all"
 	}
 
-	key, err := p.redisClient.SRandMember(ctx, setName).Result()
-	if err != nil || key == "" {
-		// Fallback to all if specific set is empty
-		key, err = p.redisClient.SRandMember(ctx, "random_pool:keys:all").Result()
+	// Retry up to 8 times to pick a matching high-resolution item
+	for attempt := 0; attempt < 8; attempt++ {
+		key, err := p.redisClient.SRandMember(ctx, setName).Result()
 		if err != nil || key == "" {
-			return nil, nil, fmt.Errorf("no images in pool")
+			key, err = p.redisClient.SRandMember(ctx, "random_pool:keys:all").Result()
+			if err != nil || key == "" {
+				return nil, nil, fmt.Errorf("no images in pool")
+			}
 		}
+
+		// Retrieve metadata
+		metaData, err := p.redisClient.Get(ctx, "random_pool:meta:"+key).Result()
+		if err != nil {
+			p.redisClient.SRem(ctx, setName, key)
+			p.redisClient.SRem(ctx, "random_pool:keys:all", key)
+			continue
+		}
+
+		var meta PoolItemMeta
+		if err := json.Unmarshal([]byte(metaData), &meta); err != nil {
+			p.redisClient.SRem(ctx, setName, key)
+			p.redisClient.SRem(ctx, "random_pool:keys:all", key)
+			continue
+		}
+
+		// Filter aspect ratio: default strictly blocks 9:16 and vertical images (< 0.95)
+		if (aspect == "" || aspect == "landscape") && meta.AspectRatio < 0.95 {
+			p.redisClient.SRem(ctx, setName, key)
+			p.redisClient.SRem(ctx, "random_pool:keys:all", key)
+			p.redisClient.SRem(ctx, "random_pool:keys:safe", key)
+			p.redisClient.SRem(ctx, "random_pool:keys:r18", key)
+			continue
+		}
+		if aspect == "portrait" && meta.AspectRatio >= 0.95 {
+			continue
+		}
+
+		// Verify size is not a tiny thumbnail (< 150KB)
+		if meta.Size < 150*1024 {
+			p.redisClient.SRem(ctx, setName, key)
+			p.redisClient.SRem(ctx, "random_pool:keys:all", key)
+			continue
+		}
+
+		obj, err := p.s3Client.GetObject(ctx, p.bucket, key, minio.GetObjectOptions{})
+		if err != nil {
+			continue
+		}
+
+		return obj, &meta, nil
 	}
 
-	// Retrieve metadata
-	metaData, err := p.redisClient.Get(ctx, "random_pool:meta:"+key).Result()
-	if err != nil {
-		return nil, nil, fmt.Errorf("missing metadata for key %s: %w", key, err)
-	}
-
-	var meta PoolItemMeta
-	if err := json.Unmarshal([]byte(metaData), &meta); err != nil {
-		return nil, nil, fmt.Errorf("failed to unmarshal metadata: %w", err)
-	}
-
-	obj, err := p.s3Client.GetObject(ctx, p.bucket, key, minio.GetObjectOptions{})
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to get S3 object: %w", err)
-	}
-
-	return obj, &meta, nil
+	return nil, nil, fmt.Errorf("no matching high-resolution landscape images found in pool")
 }
 
 // startCrawler periodically populates and maintains the S3 pool
@@ -243,41 +365,36 @@ func (p *RandomPool) crawlBatch() {
 			w, _ := item.Width.Int64()
 			h, _ := item.Height.Int64()
 			if w == 0 || h == 0 {
-				w, h = 1200, 1200
+				w, h = 1920, 1080
 			}
 			aspectRatio := float64(w) / float64(h)
 
-			// Aspect Ratio Policy: Don't too much 9:16 (aspect ratio < 0.65)
-			// Limit 9:16 portrait images to max 15% of the total pool
-			if aspectRatio < 0.65 {
-				count916, _ := p.redisClient.SCard(ctx, "random_pool:keys:portrait_9_16").Result()
-				totalCount, _ := p.redisClient.SCard(ctx, "random_pool:keys:all").Result()
-				if totalCount > 20 && float64(count916)/float64(totalCount) > 0.15 {
-					continue // Skip excess 9:16 tall wallpapers
-				}
-			}
-
-			// Download illustration
-			imageURL := item.URL
-			if imageURL == "" {
+			// Strict Aspect Ratio Policy: ONLY accept landscape and square (aspectRatio >= 0.95)
+			// Completely eliminate 9:16 (0.56) and vertical phone wallpapers
+			if aspectRatio < 0.95 {
 				continue
 			}
-			// Attempt to fetch regular / large quality
-			regularURL := strings.Replace(imageURL, "c/240x480/", "", 1)
-			regularURL = strings.Replace(regularURL, "c/540x540_70/", "", 1)
-			regularURL = strings.Replace(regularURL, "custom-thumb/", "", 1)
 
-			body, contentType, err := p.pixivClient.ProxyImage(regularURL)
-			if err != nil {
-				body, contentType, err = p.pixivClient.ProxyImage(item.URL)
-				if err != nil {
-					continue
+			// Download illustration using candidate high-res URLs (Original 2K/4K or Master 1200p)
+			var body io.ReadCloser
+			var contentType string
+			var fetchErr error
+
+			for _, candidateURL := range GetHighResCandidateURLs(item.URL) {
+				body, contentType, fetchErr = p.pixivClient.ProxyImage(candidateURL)
+				if fetchErr == nil && body != nil {
+					break
 				}
+			}
+
+			if body == nil {
+				continue
 			}
 
 			imgBytes, errRead := io.ReadAll(body)
 			body.Close()
-			if errRead != nil || len(imgBytes) == 0 {
+			// Must be at least 150KB to guarantee crisp 1080p/2K quality (no 480px thumbnails)
+			if errRead != nil || len(imgBytes) < 150*1024 {
 				continue
 			}
 
