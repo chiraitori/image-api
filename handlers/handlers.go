@@ -596,6 +596,7 @@ func SearchIllusts(w http.ResponseWriter, r *http.Request) {
 }
 
 // parseR18Preference determines whether R-18 is requested, explicitly blocked, or all-ages default.
+// By default, /image operates in safe mode (safe=true), blocking R-18 unless explicitly requested.
 func parseR18Preference(r *http.Request, mode string) (allowR18 bool, blockR18 bool, resolvedMode string) {
 	resolvedMode = mode
 	if resolvedMode == "" {
@@ -612,21 +613,15 @@ func parseR18Preference(r *http.Request, mode string) (allowR18 bool, blockR18 b
 		strings.ToLower(os.Getenv("BLOCK_NSFW")) == "true" ||
 		strings.ToLower(os.Getenv("SAFE_MODE")) == "true"
 
-	isExplicitSafe := safeParam == "true" || safeParam == "1" ||
-		blockParam == "true" || blockParam == "1" ||
-		r18Param == "false" || r18Param == "0" ||
-		nsfwParam == "false" || nsfwParam == "0" || envBlock
-
-	isExplicitR18 := r18Param == "true" || r18Param == "1" ||
-		nsfwParam == "true" || nsfwParam == "1"
-
-	if isExplicitSafe {
-		if strings.Contains(resolvedMode, "r18") {
-			resolvedMode = "daily"
-		}
-		return false, true, resolvedMode
+	if envBlock {
+		return false, true, "daily"
 	}
 
+	isExplicitR18 := r18Param == "true" || r18Param == "1" ||
+		nsfwParam == "true" || nsfwParam == "1" ||
+		safeParam == "false" || safeParam == "0"
+
+	// If R-18 is explicitly requested
 	if isExplicitR18 {
 		if !strings.Contains(resolvedMode, "r18") {
 			switch resolvedMode {
@@ -643,10 +638,18 @@ func parseR18Preference(r *http.Request, mode string) (allowR18 bool, blockR18 b
 		return true, false, resolvedMode
 	}
 
+	// If mode explicitly specifies an R-18 ranking
 	if strings.Contains(resolvedMode, "r18") {
+		// Unless user requested safe content
+		if safeParam == "true" || safeParam == "1" || blockParam == "true" || blockParam == "1" || r18Param == "false" || r18Param == "0" {
+			resolvedMode = "daily"
+			return false, true, resolvedMode
+		}
 		return true, false, resolvedMode
 	}
-	return false, false, resolvedMode
+
+	// DEFAULT: safe=true (strictly block R-18 / NSFW by default)
+	return false, true, resolvedMode
 }
 
 // RandomImage godoc

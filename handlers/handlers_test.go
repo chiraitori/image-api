@@ -22,7 +22,7 @@ func TestParseR18Preference(t *testing.T) {
 			url:          "/image",
 			mode:         "",
 			wantAllow:    false,
-			wantBlock:    false,
+			wantBlock:    true,
 			wantResolved: "daily",
 		},
 		{
