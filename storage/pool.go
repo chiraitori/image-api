@@ -229,7 +229,7 @@ func (p *RandomPool) IsEnabled() bool {
 	return p != nil && p.enabled
 }
 
-// PurgeLowResAndPortrait cleans out any remaining 9:16 portrait or <150KB thumbnail images
+// PurgeLowResAndPortrait cleans out any non-16:9/4:3 images (<1.25), 9:16 portraits, or <150KB thumbnails
 func (p *RandomPool) PurgeLowResAndPortrait(ctx context.Context) (int, error) {
 	if !p.IsEnabled() {
 		return 0, nil
@@ -250,8 +250,8 @@ func (p *RandomPool) PurgeLowResAndPortrait(ctx context.Context) (int, error) {
 			if err := json.Unmarshal([]byte(metaData), &meta); err != nil {
 				shouldDelete = true
 			} else {
-				// Purge if vertical/9:16 (< 0.95) or low-res (< 150KB)
-				if meta.AspectRatio < 0.95 || meta.Size < 150*1024 {
+				// Purge if not 16:9 / 4:3 widescreen (ratio < 1.25 or > 2.6) or low-res (< 150KB)
+				if meta.AspectRatio < 1.25 || meta.AspectRatio > 2.6 || meta.Size < 150*1024 {
 					shouldDelete = true
 				}
 			}
@@ -282,7 +282,7 @@ func (p *RandomPool) PurgeLowResAndPortrait(ctx context.Context) (int, error) {
 	p.redisClient.Set(ctx, "random_pool:total_bytes", newTotal, 0)
 
 	if purged > 0 {
-		log.Printf("[Pool] Purged %d low-res / 9:16 portrait images. Remaining high-res images: %d (%d MB)",
+		log.Printf("[Pool] Purged %d non-16:9/4:3 images. Remaining high-res widescreen images: %d (%d MB)",
 			purged, len(remainingKeys), newTotal/(1024*1024))
 	}
 	return purged, nil
@@ -305,7 +305,7 @@ func (p *RandomPool) GetRandomImage(ctx context.Context, allowR18, blockR18 bool
 		setName = "random_pool:keys:all"
 	}
 
-	// Retry up to 10 times to pick a matching high-resolution item
+	// Retry up to 10 times to pick a matching high-resolution 16:9 / 4:3 item
 	for attempt := 0; attempt < 10; attempt++ {
 		key, err := p.redisClient.SRandMember(ctx, setName).Result()
 		if err != nil || key == "" {
@@ -330,15 +330,12 @@ func (p *RandomPool) GetRandomImage(ctx context.Context, allowR18, blockR18 bool
 			continue
 		}
 
-		// Filter aspect ratio: default strictly blocks 9:16 and vertical images (< 0.95)
-		if (aspect == "" || aspect == "landscape") && meta.AspectRatio < 0.95 {
+		// Strictly require 16:9 / 4:3 widescreen landscape (ratio 1.25 - 2.6) by default
+		if (aspect == "" || aspect == "landscape") && (meta.AspectRatio < 1.25 || meta.AspectRatio > 2.6) {
 			p.redisClient.SRem(ctx, setName, key)
 			p.redisClient.SRem(ctx, "random_pool:keys:all", key)
 			p.redisClient.SRem(ctx, "random_pool:keys:safe", key)
 			p.redisClient.SRem(ctx, "random_pool:keys:r18", key)
-			continue
-		}
-		if aspect == "portrait" && meta.AspectRatio >= 0.95 {
 			continue
 		}
 
@@ -383,7 +380,6 @@ func (p *RandomPool) GetRandomImage(ctx context.Context, allowR18, blockR18 bool
 				p.redisClient.Expire(ctx, ipViewKey, 24*time.Hour)
 			}
 			// If this was the 3rd time served to this IP, delete it from S3/Redis
-			// so space is freed and background crawler automatically downloads fresh art!
 			if newCount >= 3 {
 				go func(k string, sz int64) {
 					delCtx := context.Background()
@@ -400,7 +396,7 @@ func (p *RandomPool) GetRandomImage(ctx context.Context, allowR18, blockR18 bool
 		return obj, &meta, nil
 	}
 
-	return nil, nil, fmt.Errorf("no matching high-resolution landscape images found in pool")
+	return nil, nil, fmt.Errorf("no matching high-resolution 16:9 / 4:3 images found in pool")
 }
 
 // startCrawler periodically populates and maintains the S3 pool
@@ -417,6 +413,117 @@ func (p *RandomPool) startCrawler() {
 	}
 }
 
+type candidateArt struct {
+	IllustID int
+	Title    string
+	Author   string
+	URL      string
+	Width    int64
+	Height   int64
+	IsR18    bool
+}
+
+func (p *RandomPool) saveCandidate(ctx context.Context, item candidateArt, totalBytes *int64) bool {
+	if *totalBytes >= p.targetBytes || item.IllustID == 0 || item.URL == "" {
+		return false
+	}
+
+	w, h := item.Width, item.Height
+	if w <= 0 || h <= 0 {
+		w, h = 1920, 1080
+	}
+	aspectRatio := float64(w) / float64(h)
+
+	// Strict 16:9 / 4:3 widescreen policy: ratio between 1.25 and 2.6
+	// Rejects 1:1 square (1.0), vertical portraits (< 1.0), and 9:16 (0.56)
+	if aspectRatio < 1.25 || aspectRatio > 2.6 {
+		return false
+	}
+
+	// Check if already in pool
+	isMember, _ := p.redisClient.SIsMember(ctx, "random_pool:ids", item.IllustID).Result()
+	if isMember {
+		return false
+	}
+
+	// Download high-res (Original 2K/4K or Master 1200p)
+	var body io.ReadCloser
+	var contentType string
+	var fetchErr error
+
+	for _, candidateURL := range GetHighResCandidateURLs(item.URL) {
+		body, contentType, fetchErr = p.pixivClient.ProxyImage(candidateURL)
+		if fetchErr == nil && body != nil {
+			break
+		}
+	}
+
+	if body == nil {
+		return false
+	}
+
+	rawBytes, errRead := io.ReadAll(body)
+	body.Close()
+	if errRead != nil || len(rawBytes) < 50*1024 {
+		return false
+	}
+
+	// Optimize & compress to crisp 2K JPEG (quality 82, max 2048px)
+	finalBytes, optW, optH, finalContentType, errOpt := OptimizeImageForCache(rawBytes, 2048, 82)
+	if errOpt != nil || len(finalBytes) == 0 {
+		finalBytes = rawBytes
+		finalContentType = contentType
+	} else {
+		if optW > 0 && optH > 0 {
+			w, h = int64(optW), int64(optH)
+			aspectRatio = float64(w) / float64(h)
+		}
+	}
+
+	key := fmt.Sprintf("%d_%d.jpg", item.IllustID, rand.Intn(10000))
+
+	// Store in S3
+	_, errPut := p.s3Client.PutObject(ctx, p.bucket, key, bytes.NewReader(finalBytes), int64(len(finalBytes)), minio.PutObjectOptions{
+		ContentType: finalContentType,
+	})
+	if errPut != nil {
+		log.Printf("[Pool] Error saving to S3: %v", errPut)
+		return false
+	}
+
+	meta := PoolItemMeta{
+		IllustID:    item.IllustID,
+		Title:       item.Title,
+		Author:      item.Author,
+		ContentType: finalContentType,
+		Size:        int64(len(finalBytes)),
+		Width:       int(w),
+		Height:      int(h),
+		AspectRatio: aspectRatio,
+		IsR18:       item.IsR18,
+		Key:         key,
+	}
+
+	metaJSON, _ := json.Marshal(meta)
+
+	// Index in Redis
+	pipe := p.redisClient.Pipeline()
+	pipe.SAdd(ctx, "random_pool:ids", item.IllustID)
+	pipe.SAdd(ctx, "random_pool:keys:all", key)
+	if item.IsR18 {
+		pipe.SAdd(ctx, "random_pool:keys:r18", key)
+	} else {
+		pipe.SAdd(ctx, "random_pool:keys:safe", key)
+	}
+	pipe.Set(ctx, "random_pool:meta:"+key, string(metaJSON), 0)
+	pipe.IncrBy(ctx, "random_pool:total_bytes", int64(len(finalBytes)))
+	_, _ = pipe.Exec(ctx)
+
+	*totalBytes += int64(len(finalBytes))
+	time.Sleep(300 * time.Millisecond) // Polite crawling throttle
+	return true
+}
+
 func (p *RandomPool) crawlBatch() {
 	ctx := context.Background()
 
@@ -426,8 +533,88 @@ func (p *RandomPool) crawlBatch() {
 		return
 	}
 
-	// Modes to pull high-quality pictures from
-	modes := []string{"daily", "weekly", "monthly", "rookie", "original", "daily_ai"}
+	// 1. Crawl all popular anime and anime games for high-quality 16:9 / 4:3 wallpapers
+	animeGameTags := []string{
+		// Anime Games (HoYoverse, Kuro, Yostar, Type-Moon, etc.)
+		"原神",                // Genshin Impact
+		"GenshinImpact",
+		"崩壊:スターレイル",       // Honkai: Star Rail (HSR)
+		"HonkaiStarRail",
+		"スターレイル",
+		"ゼンレスゾーンゼロ",       // Zenless Zone Zero (ZZZ)
+		"ZenlessZoneZero",
+		"鳴潮",                // Wuthering Waves (WuWa)
+		"WutheringWaves",
+		"ブルーアーカイブ",        // Blue Archive
+		"ブルアカ",
+		"アークナイツ",          // Arknights
+		"Fate/GrandOrder",    // Fate / FGO
+		"FGO",
+		"勝利の女神:NIKKE",     // NIKKE
+		"ウマ娘プリティーダービー",    // Uma Musume
+		"アズールレーン",         // Azur Lane
+		"崩壊3rd",             // Honkai Impact 3rd
+
+		// Major Anime & Franchises
+		"アニメ",               // General Anime
+		"anime",
+		"葬送のフリーレン",        // Frieren
+		"ぼっち・ざ・ろっく!",      // Bocchi the Rock
+		"【推しの子】",           // Oshi no Ko
+		"リコリス・リコイル",       // Lycoris Recoil
+		"呪術廻戦",             // Jujutsu Kaisen
+		"鬼滅の刃",             // Demon Slayer
+		"チェンソーマン",          // Chainsaw Man
+		"SPY×FAMILY",
+		"Re:ゼロから始める異世界生活", // Re:Zero
+		"ホロライブ",            // Hololive / VTuber
+		"にじさんじ",            // Nijisanji
+
+		// High Quality Scenery & Wallpaper Art
+		"風景",                // Anime Scenery / Landscape
+		"アニメ背景",            // Anime Backgrounds
+		"壁紙",                // Anime Wallpapers
+		"女の子",               // Anime Girls
+	}
+
+	for _, tag := range animeGameTags {
+		if totalBytes >= p.targetBytes {
+			break
+		}
+		for page := 1; page <= 2; page++ {
+			if totalBytes >= p.targetBytes {
+				break
+			}
+			res, err := p.pixivClient.SearchIllusts(tag, page)
+			if err != nil || res == nil || len(res.Illusts) == 0 {
+				continue
+			}
+			for _, illust := range res.Illusts {
+				if totalBytes >= p.targetBytes {
+					break
+				}
+				if illust.PageCount > 1 {
+					continue // single-page illustrations only
+				}
+				id, _ := strconv.Atoi(illust.ID)
+				if id == 0 {
+					continue
+				}
+				p.saveCandidate(ctx, candidateArt{
+					IllustID: id,
+					Title:    illust.Title,
+					Author:   illust.UserName,
+					URL:      illust.Thumbnail,
+					Width:    int64(illust.Width),
+					Height:   int64(illust.Height),
+					IsR18:    false,
+				}, &totalBytes)
+			}
+		}
+	}
+
+	// 2. Crawl trending daily, weekly, monthly rankings
+	modes := []string{"daily", "weekly", "monthly", "original", "daily_ai"}
 	if p.pixivClient.IsLoggedIn() || p.pixivClient.GetCookie() != "" || p.pixivClient.HasTokens() {
 		modes = append(modes, "daily_r18", "weekly_r18")
 	}
@@ -447,7 +634,6 @@ func (p *RandomPool) crawlBatch() {
 				break
 			}
 
-			// Single illustrations only
 			if item.GetPageCount() > 1 || (item.IllustType != "0" && item.IllustType != "") {
 				continue
 			}
@@ -457,107 +643,19 @@ func (p *RandomPool) crawlBatch() {
 				continue
 			}
 
-			// Check if already downloaded
-			isMember, _ := p.redisClient.SIsMember(ctx, "random_pool:ids", illustID).Result()
-			if isMember {
-				continue
-			}
-
 			w, _ := item.Width.Int64()
 			h, _ := item.Height.Int64()
-			if w == 0 || h == 0 {
-				w, h = 1920, 1080
-			}
-			aspectRatio := float64(w) / float64(h)
-
-			// Strict Aspect Ratio Policy: ONLY accept landscape and square (aspectRatio >= 0.95)
-			// Completely eliminate 9:16 (0.56) and vertical phone wallpapers
-			if aspectRatio < 0.95 {
-				continue
-			}
-
-			// Download illustration using candidate high-res URLs (Original 2K/4K or Master 1200p)
-			var body io.ReadCloser
-			var contentType string
-			var fetchErr error
-
-			for _, candidateURL := range GetHighResCandidateURLs(item.URL) {
-				body, contentType, fetchErr = p.pixivClient.ProxyImage(candidateURL)
-				if fetchErr == nil && body != nil {
-					break
-				}
-			}
-
-			if body == nil {
-				continue
-			}
-
-			rawBytes, errRead := io.ReadAll(body)
-			body.Close()
-			if errRead != nil || len(rawBytes) < 50*1024 {
-				continue
-			}
-
-			// Optimize & compress down for S3 cache:
-			// Resizes 4K/oversized images to max 2048px (2K) and encodes with JPEG quality 82.
-			// Slashes file size down to ~350KB-600KB so the 5GB S3 cache holds 10,000+ images!
-			finalBytes, optW, optH, finalContentType, errOpt := OptimizeImageForCache(rawBytes, 2048, 82)
-			if errOpt != nil || len(finalBytes) == 0 {
-				finalBytes = rawBytes
-				finalContentType = contentType
-			} else {
-				if optW > 0 && optH > 0 {
-					w, h = int64(optW), int64(optH)
-					aspectRatio = float64(w) / float64(h)
-				}
-			}
-
-			key := fmt.Sprintf("%d_%d.jpg", illustID, rand.Intn(10000))
-
-			// Store in S3
-			_, errPut := p.s3Client.PutObject(ctx, p.bucket, key, bytes.NewReader(finalBytes), int64(len(finalBytes)), minio.PutObjectOptions{
-				ContentType: finalContentType,
-			})
-			if errPut != nil {
-				log.Printf("[Pool] Error saving to S3: %v", errPut)
-				continue
-			}
-
 			isR18 := item.IsR18() || strings.Contains(mode, "r18")
 
-			meta := PoolItemMeta{
-				IllustID:    illustID,
-				Title:       item.Title,
-				Author:      item.UserName,
-				ContentType: finalContentType,
-				Size:        int64(len(finalBytes)),
-				Width:       int(w),
-				Height:      int(h),
-				AspectRatio: aspectRatio,
-				IsR18:       isR18,
-				Key:         key,
-			}
-
-			metaJSON, _ := json.Marshal(meta)
-
-			// Index in Redis
-			pipe := p.redisClient.Pipeline()
-			pipe.SAdd(ctx, "random_pool:ids", illustID)
-			pipe.SAdd(ctx, "random_pool:keys:all", key)
-			if isR18 {
-				pipe.SAdd(ctx, "random_pool:keys:r18", key)
-			} else {
-				pipe.SAdd(ctx, "random_pool:keys:safe", key)
-			}
-			if aspectRatio < 0.65 {
-				pipe.SAdd(ctx, "random_pool:keys:portrait_9_16", key)
-			}
-			pipe.Set(ctx, "random_pool:meta:"+key, string(metaJSON), 0)
-			pipe.IncrBy(ctx, "random_pool:total_bytes", int64(len(finalBytes)))
-			_, _ = pipe.Exec(ctx)
-
-			totalBytes += int64(len(finalBytes))
-			time.Sleep(300 * time.Millisecond) // Polite crawling throttle
+			p.saveCandidate(ctx, candidateArt{
+				IllustID: illustID,
+				Title:    item.Title,
+				Author:   item.UserName,
+				URL:      item.URL,
+				Width:    w,
+				Height:   h,
+				IsR18:    isR18,
+			}, &totalBytes)
 		}
 	}
 }
