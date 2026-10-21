@@ -12,6 +12,8 @@ RUN go mod download
 
 COPY . .
 
+RUN mkdir -p /app/paperback-extensions/bundles
+
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o image-api .
 
 # Final runner stage
