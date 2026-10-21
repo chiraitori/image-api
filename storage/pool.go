@@ -309,8 +309,8 @@ func (p *RandomPool) GetRandomImage(ctx context.Context, allowR18, blockR18 bool
 		setName = "random_pool:keys:all"
 	}
 
-	// Retry up to 10 times to pick a matching high-resolution 16:9 / 4:3 item
-	for attempt := 0; attempt < 10; attempt++ {
+	// Retry up to 25 times to pick a matching high-resolution item that hasn't been recently seen
+	for attempt := 0; attempt < 25; attempt++ {
 		key, err := p.redisClient.SRandMember(ctx, setName).Result()
 		if err != nil || key == "" {
 			key, err = p.redisClient.SRandMember(ctx, "random_pool:keys:all").Result()
@@ -356,6 +356,15 @@ func (p *RandomPool) GetRandomImage(ctx context.Context, allowR18, blockR18 bool
 			continue
 		}
 
+		// Anti-repeat: ensure client IP doesn't see recently served images (up to attempt 20)
+		if clientIP != "" && attempt < 20 {
+			recentKey := fmt.Sprintf("random_pool:recent:%s", clientIP)
+			isRecent, _ := p.redisClient.SIsMember(ctx, recentKey, meta.IllustID).Result()
+			if isRecent {
+				continue // User saw this recently -> pick another
+			}
+		}
+
 		// Check 24-hour per-IP repetition limit (3 times in 1 day)
 		if clientIP != "" {
 			ipViewKey := fmt.Sprintf("random_pool:views:%s:%d", clientIP, meta.IllustID)
@@ -382,8 +391,15 @@ func (p *RandomPool) GetRandomImage(ctx context.Context, allowR18, blockR18 bool
 			continue
 		}
 
-		// Record view count for this client IP with 24-hour expiration
+		// Record view count and anti-repeat history for this client IP
 		if clientIP != "" {
+			recentKey := fmt.Sprintf("random_pool:recent:%s", clientIP)
+			p.redisClient.SAdd(ctx, recentKey, meta.IllustID)
+			p.redisClient.Expire(ctx, recentKey, 6*time.Hour)
+			if card, _ := p.redisClient.SCard(ctx, recentKey).Result(); card > 60 {
+				p.redisClient.SPop(ctx, recentKey)
+			}
+
 			ipViewKey := fmt.Sprintf("random_pool:views:%s:%d", clientIP, meta.IllustID)
 			newCount, _ := p.redisClient.Incr(ctx, ipViewKey).Result()
 			if newCount == 1 {
@@ -530,7 +546,7 @@ func (p *RandomPool) saveCandidate(ctx context.Context, item candidateArt, total
 	_, _ = pipe.Exec(ctx)
 
 	*totalBytes += int64(len(finalBytes))
-	time.Sleep(300 * time.Millisecond) // Polite crawling throttle
+	time.Sleep(100 * time.Millisecond) // Polite crawling throttle
 	return true
 }
 
@@ -591,7 +607,7 @@ func (p *RandomPool) crawlBatch() {
 		if totalBytes >= p.targetBytes {
 			break
 		}
-		for page := 1; page <= 2; page++ {
+		for page := 1; page <= 3; page++ {
 			if totalBytes >= p.targetBytes {
 				break
 			}
@@ -623,49 +639,55 @@ func (p *RandomPool) crawlBatch() {
 		}
 	}
 
-	// 2. Crawl trending daily, weekly, monthly rankings
+	// 2. Crawl trending daily, weekly, monthly rankings across recent days
 	modes := []string{"daily", "weekly", "monthly", "original", "daily_ai"}
 	if p.pixivClient.IsLoggedIn() || p.pixivClient.GetCookie() != "" || p.pixivClient.HasTokens() {
 		modes = append(modes, "daily_r18", "weekly_r18")
 	}
 
-	for _, mode := range modes {
+	dates := []string{"", time.Now().AddDate(0, 0, -1).Format("20060102"), time.Now().AddDate(0, 0, -2).Format("20060102")}
+	for _, date := range dates {
 		if totalBytes >= p.targetBytes {
 			break
 		}
-
-		res, err := p.pixivClient.GetRankingBatch(mode, 2, "")
-		if err != nil || res == nil {
-			continue
-		}
-
-		for _, item := range res.Contents {
+		for _, mode := range modes {
 			if totalBytes >= p.targetBytes {
 				break
 			}
 
-			if item.GetPageCount() > 1 || (item.IllustType != "0" && item.IllustType != "") {
+			res, err := p.pixivClient.GetRankingBatch(mode, 4, date)
+			if err != nil || res == nil {
 				continue
 			}
 
-			illustID := item.GetIllustID()
-			if illustID == 0 {
-				continue
+			for _, item := range res.Contents {
+				if totalBytes >= p.targetBytes {
+					break
+				}
+
+				if item.GetPageCount() > 1 || (item.IllustType != "0" && item.IllustType != "") {
+					continue
+				}
+
+				illustID := item.GetIllustID()
+				if illustID == 0 {
+					continue
+				}
+
+				w, _ := item.Width.Int64()
+				h, _ := item.Height.Int64()
+				isR18 := item.IsR18() || strings.Contains(mode, "r18")
+
+				p.saveCandidate(ctx, candidateArt{
+					IllustID: illustID,
+					Title:    item.Title,
+					Author:   item.UserName,
+					URL:      item.URL,
+					Width:    w,
+					Height:   h,
+					IsR18:    isR18,
+				}, &totalBytes)
 			}
-
-			w, _ := item.Width.Int64()
-			h, _ := item.Height.Int64()
-			isR18 := item.IsR18() || strings.Contains(mode, "r18")
-
-			p.saveCandidate(ctx, candidateArt{
-				IllustID: illustID,
-				Title:    item.Title,
-				Author:   item.UserName,
-				URL:      item.URL,
-				Width:    w,
-				Height:   h,
-				IsR18:    isR18,
-			}, &totalBytes)
 		}
 	}
 }
