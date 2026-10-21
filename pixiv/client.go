@@ -23,7 +23,18 @@ const (
 	// OAuth endpoints
 	oauthTokenURL = "https://oauth.secure.pixiv.net/auth/token"
 	appAPIURL     = "https://app-api.pixiv.net"
+
+	maxCacheEntries = 1000
 )
+
+const defaultTokenFilePath = ".tokens.json"
+
+// StoredTokens represents persisted OAuth tokens
+type StoredTokens struct {
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token"`
+	UpdatedAt    string `json:"updated_at"`
+}
 
 // OAuth credentials - loaded from environment variables
 var (
@@ -40,14 +51,15 @@ func getEnvOrDefault(key, defaultValue string) string {
 
 // Client represents a Pixiv API client
 type Client struct {
-	httpClient   *http.Client
-	cookie       string
-	accessToken  string
-	refreshToken string
-	loggedIn     bool
-	mu           sync.RWMutex
-	rankingCache map[string]rankingCacheEntry
-	pagesCache   map[string]pagesCacheEntry
+	httpClient    *http.Client
+	cookie        string
+	accessToken   string
+	refreshToken  string
+	loggedIn      bool
+	tokenFilePath string
+	mu            sync.RWMutex
+	rankingCache  map[string]rankingCacheEntry
+	pagesCache    map[string]pagesCacheEntry
 }
 
 type ImageResponse struct {
@@ -92,7 +104,7 @@ type LoginCredentials struct {
 // NewClient creates a new Pixiv client
 func NewClient(cookie string) *Client {
 	jar, _ := cookiejar.New(nil)
-	return &Client{
+	c := &Client{
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 			Jar:     jar,
@@ -105,11 +117,22 @@ func NewClient(cookie string) *Client {
 				ExpectContinueTimeout: 1 * time.Second,
 			},
 		},
-		cookie:       cookie,
-		loggedIn:     cookie != "",
-		rankingCache: make(map[string]rankingCacheEntry),
-		pagesCache:   make(map[string]pagesCacheEntry),
+		cookie:        cookie,
+		loggedIn:      cookie != "",
+		tokenFilePath: defaultTokenFilePath,
+		rankingCache:  make(map[string]rankingCacheEntry),
+		pagesCache:    make(map[string]pagesCacheEntry),
 	}
+
+	// Background eviction to prevent unbounded memory growth
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		for range ticker.C {
+			c.pruneExpiredCache()
+		}
+	}()
+
+	return c
 }
 
 // SetCookie updates the client cookie
@@ -137,10 +160,99 @@ func (c *Client) IsLoggedIn() bool {
 // SetTokens sets OAuth access and refresh tokens
 func (c *Client) SetTokens(accessToken, refreshToken string) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.accessToken = accessToken
 	c.refreshToken = refreshToken
 	c.loggedIn = accessToken != ""
+	c.mu.Unlock()
+
+	// Persist tokens
+	_ = c.SaveTokens()
+}
+
+// SetTokenFilePath sets the file path for persisting tokens
+func (c *Client) SetTokenFilePath(path string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.tokenFilePath = path
+}
+
+// SaveTokens persists tokens to disk
+func (c *Client) SaveTokens() error {
+	c.mu.RLock()
+	filePath := c.tokenFilePath
+	accessToken := c.accessToken
+	refreshToken := c.refreshToken
+	c.mu.RUnlock()
+
+	if filePath == "" || (accessToken == "" && refreshToken == "") {
+		return nil
+	}
+
+	data := StoredTokens{
+		AccessToken:  accessToken,
+		RefreshToken: refreshToken,
+		UpdatedAt:    time.Now().Format(time.RFC3339),
+	}
+	content, err := json.MarshalIndent(data, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filePath, content, 0600)
+}
+
+// LoadTokens loads persisted tokens from disk
+func (c *Client) LoadTokens() error {
+	c.mu.RLock()
+	filePath := c.tokenFilePath
+	c.mu.RUnlock()
+
+	if filePath == "" {
+		filePath = defaultTokenFilePath
+	}
+
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		return err
+	}
+
+	var data StoredTokens
+	if err := json.Unmarshal(content, &data); err != nil {
+		return err
+	}
+
+	if data.AccessToken != "" || data.RefreshToken != "" {
+		c.mu.Lock()
+		c.accessToken = data.AccessToken
+		c.refreshToken = data.RefreshToken
+		c.loggedIn = data.AccessToken != ""
+		c.mu.Unlock()
+	}
+	return nil
+}
+
+// pruneExpiredCache deletes expired cache entries and caps memory usage
+func (c *Client) pruneExpiredCache() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	now := time.Now()
+	for k, v := range c.rankingCache {
+		if now.After(v.expires) {
+			delete(c.rankingCache, k)
+		}
+	}
+	for k, v := range c.pagesCache {
+		if now.After(v.expires) {
+			delete(c.pagesCache, k)
+		}
+	}
+
+	if len(c.rankingCache) > maxCacheEntries {
+		c.rankingCache = make(map[string]rankingCacheEntry)
+	}
+	if len(c.pagesCache) > maxCacheEntries {
+		c.pagesCache = make(map[string]pagesCacheEntry)
+	}
 }
 
 // GetTokens returns the current OAuth tokens
@@ -187,6 +299,14 @@ func (c *Client) getCachedPages(illustID string) ([]ImageURL, bool) {
 func (c *Client) setCachedPages(illustID string, urls []ImageURL) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if len(c.pagesCache) >= maxCacheEntries {
+		now := time.Now()
+		for k, v := range c.pagesCache {
+			if now.After(v.expires) {
+				delete(c.pagesCache, k)
+			}
+		}
+	}
 	c.pagesCache[illustID] = pagesCacheEntry{
 		urls:    cloneImageURLs(urls),
 		expires: time.Now().Add(30 * time.Minute),
@@ -206,6 +326,14 @@ func (c *Client) getCachedRanking(key string) (*RankingResult, bool) {
 func (c *Client) setCachedRanking(key string, result *RankingResult) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if len(c.rankingCache) >= maxCacheEntries {
+		now := time.Now()
+		for k, v := range c.rankingCache {
+			if now.After(v.expires) {
+				delete(c.rankingCache, k)
+			}
+		}
+	}
 	c.rankingCache[key] = rankingCacheEntry{
 		result:  cloneRankingResult(result),
 		expires: time.Now().Add(5 * time.Minute),
@@ -477,7 +605,13 @@ func cloneRankingResult(result *RankingResult) *RankingResult {
 	}
 	cloned := *result
 	cloned.Contents = make([]RankingItem, len(result.Contents))
-	copy(cloned.Contents, result.Contents)
+	for i, item := range result.Contents {
+		cloned.Contents[i] = item
+		if item.Tags != nil {
+			cloned.Contents[i].Tags = make([]string, len(item.Tags))
+			copy(cloned.Contents[i].Tags, item.Tags)
+		}
+	}
 	return &cloned
 }
 
@@ -525,6 +659,22 @@ type RankingItem struct {
 	Height          json.Number `json:"height"`
 	IllustType      string      `json:"illust_type"`
 	IllustPageCount json.Number `json:"illust_page_count"`
+	Tags            []string    `json:"tags,omitempty"`
+}
+
+// IsR18 reports whether the ranking item is explicitly tagged or titled as R-18/NSFW
+func (r RankingItem) IsR18() bool {
+	for _, tag := range r.Tags {
+		t := strings.ToLower(strings.TrimSpace(tag))
+		if t == "r-18" || t == "r-18g" || t == "r18" || t == "r18g" {
+			return true
+		}
+	}
+	title := strings.ToLower(r.Title)
+	if strings.Contains(title, "r-18") || strings.Contains(title, "r18") {
+		return true
+	}
+	return false
 }
 
 // GetIllustID returns the illust ID as int
@@ -570,9 +720,28 @@ func (c *Client) doRequestWithAuth(method, requestURL string, includeAuth bool) 
 		if cookie := c.cookieHeader(); cookie != "" {
 			req.Header.Set("Cookie", cookie)
 		}
+		c.mu.RLock()
+		accessToken := c.accessToken
+		c.mu.RUnlock()
+		if accessToken != "" && (strings.Contains(requestURL, "app-api.pixiv.net") || strings.Contains(requestURL, "oauth.secure.pixiv.net")) {
+			req.Header.Set("Authorization", "Bearer "+accessToken)
+		}
 	}
 
-	return c.httpClient.Do(req)
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+
+	// Auto-refresh token if App API returned 401 and we have a refresh token
+	if resp.StatusCode == http.StatusUnauthorized && includeAuth && c.HasTokens() && strings.Contains(requestURL, "app-api.pixiv.net") {
+		resp.Body.Close()
+		if _, err := c.RefreshAccessToken(); err == nil {
+			return c.doRequestWithAuth(method, requestURL, true)
+		}
+	}
+
+	return resp, nil
 }
 
 func shouldRetryWithoutAuth(resp *http.Response) bool {
@@ -776,6 +945,14 @@ func (c *Client) GetRanking(mode string, page int, date string) (*RankingResult,
 		return nil, fmt.Errorf("API returned status %d", resp.StatusCode)
 	}
 
+	contentType := resp.Header.Get("Content-Type")
+	if !strings.Contains(strings.ToLower(contentType), "application/json") {
+		if strings.Contains(mode, "r18") {
+			return nil, fmt.Errorf("authentication required for R-18 ranking: please set a valid PIXIV_COOKIE")
+		}
+		return nil, fmt.Errorf("unexpected content type from Pixiv ranking: %s", contentType)
+	}
+
 	var result RankingResult
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, fmt.Errorf("failed to decode response: %w", err)
@@ -787,8 +964,19 @@ func (c *Client) GetRanking(mode string, page int, date string) (*RankingResult,
 
 // GetRankingBatch fetches and merges several ranking pages for a larger random pool.
 func (c *Client) GetRankingBatch(mode string, pages int, date string) (*RankingResult, error) {
+	if mode == "" {
+		mode = "daily"
+	}
 	if pages <= 1 {
 		return c.GetRanking(mode, 1, date)
+	}
+	if pages > 4 {
+		pages = 4
+	}
+
+	batchCacheKey := fmt.Sprintf("batch:%s:%d:%s", mode, pages, date)
+	if cached, ok := c.getCachedRanking(batchCacheKey); ok {
+		return cached, nil
 	}
 
 	type pageResult struct {
@@ -820,6 +1008,9 @@ func (c *Client) GetRankingBatch(mode string, pages int, date string) (*RankingR
 			}
 			continue
 		}
+		if pageResult.result == nil {
+			continue
+		}
 		if merged.Date == "" {
 			merged.Date = pageResult.result.Date
 		}
@@ -836,6 +1027,14 @@ func (c *Client) GetRankingBatch(mode string, pages int, date string) (*RankingR
 	if len(merged.Contents) == 0 && firstErr != nil {
 		return nil, firstErr
 	}
+
+	// Cache the merged batch for 10 minutes to minimize outbound requests
+	c.mu.Lock()
+	c.rankingCache[batchCacheKey] = rankingCacheEntry{
+		result:  cloneRankingResult(merged),
+		expires: time.Now().Add(10 * time.Minute),
+	}
+	c.mu.Unlock()
 
 	return merged, nil
 }

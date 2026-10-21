@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -326,6 +328,38 @@ func PaperbackPages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	json.NewEncoder(w).Encode(map[string]interface{}{"pages": pageURLs})
+}
+
+// PaperbackHandler creates an HTTP handler that serves Paperback dynamic API routes
+// while falling back to static extension bundles in staticDir for extension assets.
+func PaperbackHandler(staticDir string) http.HandlerFunc {
+	fs := http.StripPrefix("/paperback/", http.FileServer(http.Dir(staticDir)))
+	return func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+
+		switch {
+		case path == "/paperback/" || path == "/paperback":
+			if _, err := os.Stat(filepath.Join(staticDir, "index.html")); err == nil && !strings.Contains(r.Header.Get("Accept"), "application/json") {
+				fs.ServeHTTP(w, r)
+				return
+			}
+			PaperbackSourceList(w, r)
+		case path == "/paperback/versioning.json":
+			PaperbackVersioning(w, r)
+		case path == "/paperback/pixiv" || path == "/paperback/pixiv/":
+			PaperbackHome(w, r)
+		case path == "/paperback/pixiv/search":
+			PaperbackSearch(w, r)
+		case strings.HasPrefix(path, "/paperback/pixiv/manga/") && strings.HasSuffix(path, "/chapters"):
+			PaperbackChapters(w, r)
+		case strings.HasPrefix(path, "/paperback/pixiv/manga/"):
+			PaperbackMangaDetails(w, r)
+		case strings.HasPrefix(path, "/paperback/pixiv/chapter/"):
+			PaperbackPages(w, r)
+		default:
+			fs.ServeHTTP(w, r)
+		}
+	}
 }
 
 // PaperbackRouter handles all /paperback/ routes

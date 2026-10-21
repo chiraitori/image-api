@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -132,9 +133,24 @@ func KemonoProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var fileURL string
-	if strings.HasPrefix(path, "http") {
+	if strings.HasPrefix(path, "http://") || strings.HasPrefix(path, "https://") {
+		parsed, err := url.Parse(path)
+		if err != nil {
+			http.Error(w, "Invalid URL", http.StatusBadRequest)
+			return
+		}
+		host := strings.ToLower(parsed.Hostname())
+		isAllowed := host == "kemono.cr" || host == "kemono.party" || host == "kemono.su" ||
+			strings.HasSuffix(host, ".kemono.cr") || strings.HasSuffix(host, ".kemono.party") || strings.HasSuffix(host, ".kemono.su")
+		if !isAllowed {
+			http.Error(w, "Forbidden: Only Kemono URLs are permitted", http.StatusForbidden)
+			return
+		}
 		fileURL = path
 	} else {
+		if !strings.HasPrefix(path, "/") {
+			path = "/" + path
+		}
 		fileURL = KEMONO_BASE_URL + path
 	}
 

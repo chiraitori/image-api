@@ -2,10 +2,13 @@ package handlers
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"math/rand"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -13,6 +16,7 @@ import (
 	"time"
 
 	"image-api/pixiv"
+	"image-api/storage"
 )
 
 func init() {
@@ -51,6 +55,11 @@ func pickFreshRankingItem(key string, items []pixiv.RankingItem) (pixiv.RankingI
 
 	randomHistory.mu.Lock()
 	defer randomHistory.mu.Unlock()
+
+	// Prevent unbounded growth of tracking keys
+	if len(randomHistory.ids) > 100 {
+		randomHistory.ids = make(map[string][]int)
+	}
 
 	recentSet := make(map[int]bool)
 	for _, id := range randomHistory.ids[key] {
@@ -94,19 +103,26 @@ func InitClient() {
 	cookie := os.Getenv("PIXIV_COOKIE")
 	client = pixiv.NewClient(cookie)
 
-	// Load OAuth tokens from environment
-	accessToken := os.Getenv("PIXIV_ACCESS_TOKEN")
-	refreshToken := os.Getenv("PIXIV_REFRESH_TOKEN")
-	if accessToken != "" || refreshToken != "" {
-		client.SetTokens(accessToken, refreshToken)
-		if refreshToken != "" {
-			if _, err := client.RefreshAccessToken(); err != nil {
-				log.Printf("Pixiv OAuth token refresh failed: %v", err)
+	// Try loading persisted OAuth tokens from disk first
+	if err := client.LoadTokens(); err == nil {
+		log.Printf("Pixiv client loaded saved OAuth tokens from disk")
+	}
+
+	// Load OAuth tokens from environment if not already loaded
+	if !client.HasTokens() {
+		accessToken := os.Getenv("PIXIV_ACCESS_TOKEN")
+		refreshToken := os.Getenv("PIXIV_REFRESH_TOKEN")
+		if accessToken != "" || refreshToken != "" {
+			client.SetTokens(accessToken, refreshToken)
+			if refreshToken != "" {
+				if _, err := client.RefreshAccessToken(); err != nil {
+					log.Printf("Pixiv OAuth token refresh failed: %v", err)
+				} else {
+					log.Printf("Pixiv client refreshed OAuth tokens")
+				}
 			} else {
-				log.Printf("Pixiv client refreshed OAuth tokens")
+				log.Printf("Pixiv client initialized with OAuth access token")
 			}
-		} else {
-			log.Printf("Pixiv client initialized with OAuth access token")
 		}
 	}
 
@@ -114,9 +130,43 @@ func InitClient() {
 		log.Printf("Pixiv client initialized with cookie")
 	}
 
-	if cookie == "" && accessToken == "" && refreshToken == "" {
+	if cookie == "" && !client.HasTokens() {
 		log.Printf("Pixiv client initialized without auth (R18 content unavailable)")
 	}
+
+	// Initialize S3 and Redis image pool if configured
+	storage.InitPool(client)
+}
+
+// checkAdminAuth verifies caller is authorized to modify auth/session state
+func checkAdminAuth(r *http.Request) bool {
+	adminKey := os.Getenv("ADMIN_API_KEY")
+	if adminKey == "" {
+		adminKey = os.Getenv("API_SECRET")
+	}
+
+	if adminKey == "" {
+		// If no key is set, only allow local requests from VPS localhost
+		remote := r.RemoteAddr
+		host, _, err := net.SplitHostPort(remote)
+		if err != nil {
+			host = remote
+		}
+		return host == "127.0.0.1" || host == "::1" || host == "localhost"
+	}
+
+	if r.Header.Get("X-Admin-Key") == adminKey {
+		return true
+	}
+	if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
+		if strings.TrimPrefix(auth, "Bearer ") == adminKey {
+			return true
+		}
+	}
+	if r.URL.Query().Get("key") == adminKey {
+		return true
+	}
+	return false
 }
 
 // Response helpers
@@ -178,6 +228,11 @@ type CodeExchangeRequest struct {
 func Login(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	if !checkAdminAuth(r) {
+		writeError(w, http.StatusForbidden, "Unauthorized: valid ADMIN_API_KEY required")
 		return
 	}
 
@@ -252,6 +307,11 @@ func SetTokens(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !checkAdminAuth(r) {
+		writeError(w, http.StatusForbidden, "Unauthorized: valid ADMIN_API_KEY required")
+		return
+	}
+
 	var req TokenRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "Invalid request body")
@@ -284,6 +344,11 @@ func SetTokens(w http.ResponseWriter, r *http.Request) {
 func ExchangeCode(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	if !checkAdminAuth(r) {
+		writeError(w, http.StatusForbidden, "Unauthorized: valid ADMIN_API_KEY required")
 		return
 	}
 
@@ -329,6 +394,11 @@ func ExchangeCode(w http.ResponseWriter, r *http.Request) {
 func RefreshToken(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	if !checkAdminAuth(r) {
+		writeError(w, http.StatusForbidden, "Unauthorized: valid ADMIN_API_KEY required")
 		return
 	}
 
@@ -388,9 +458,15 @@ func GetIllust(w http.ResponseWriter, r *http.Request) {
 	if strings.HasSuffix(path, "/pages") || r.URL.Query().Get("pages") == "true" {
 		illustID = strings.TrimSuffix(illustID, "/pages")
 		pages, err := client.GetIllustPages(illustID)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
+		if err != nil || len(pages) == 0 {
+			// Fallback: fetch single illust detail and wrap its URLs as a single page
+			detail, errDetail := client.GetIllustDetail(illustID)
+			if errDetail == nil && detail != nil {
+				pages = []pixiv.ImageURL{detail.URLs}
+			} else if err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
 		}
 		writeSuccess(w, pages)
 		return
@@ -436,8 +512,17 @@ func ProxyImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate that the URL is from Pixiv
-	if !strings.Contains(imageURL, "pximg.net") && !strings.Contains(imageURL, "pixiv.net") {
+	// Validate that the URL is strictly from Pixiv image servers
+	parsedURL, err := url.Parse(imageURL)
+	if err != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") {
+		writeError(w, http.StatusBadRequest, "Invalid image URL")
+		return
+	}
+
+	host := strings.ToLower(parsedURL.Hostname())
+	isPixivHost := host == "i.pximg.net" || host == "s.pximg.net" || host == "www.pixiv.net" ||
+		host == "embed.pixiv.net" || strings.HasSuffix(host, ".pximg.net") || strings.HasSuffix(host, ".pixiv.net")
+	if !isPixivHost {
 		writeError(w, http.StatusBadRequest, "Only Pixiv image URLs are allowed")
 		return
 	}
@@ -510,14 +595,71 @@ func SearchIllusts(w http.ResponseWriter, r *http.Request) {
 	writeSuccess(w, results)
 }
 
+// parseR18Preference determines whether R-18 is requested, explicitly blocked, or all-ages default.
+func parseR18Preference(r *http.Request, mode string) (allowR18 bool, blockR18 bool, resolvedMode string) {
+	resolvedMode = mode
+	if resolvedMode == "" {
+		resolvedMode = "daily"
+	}
+
+	q := r.URL.Query()
+	r18Param := strings.ToLower(q.Get("r18"))
+	nsfwParam := strings.ToLower(q.Get("nsfw"))
+	safeParam := strings.ToLower(q.Get("safe"))
+	blockParam := strings.ToLower(q.Get("block_r18"))
+
+	envBlock := strings.ToLower(os.Getenv("BLOCK_R18")) == "true" ||
+		strings.ToLower(os.Getenv("BLOCK_NSFW")) == "true" ||
+		strings.ToLower(os.Getenv("SAFE_MODE")) == "true"
+
+	isExplicitSafe := safeParam == "true" || safeParam == "1" ||
+		blockParam == "true" || blockParam == "1" ||
+		r18Param == "false" || r18Param == "0" ||
+		nsfwParam == "false" || nsfwParam == "0" || envBlock
+
+	isExplicitR18 := r18Param == "true" || r18Param == "1" ||
+		nsfwParam == "true" || nsfwParam == "1"
+
+	if isExplicitSafe {
+		if strings.Contains(resolvedMode, "r18") {
+			resolvedMode = "daily"
+		}
+		return false, true, resolvedMode
+	}
+
+	if isExplicitR18 {
+		if !strings.Contains(resolvedMode, "r18") {
+			switch resolvedMode {
+			case "weekly":
+				resolvedMode = "weekly_r18"
+			case "male":
+				resolvedMode = "male_r18"
+			case "female":
+				resolvedMode = "female_r18"
+			default:
+				resolvedMode = "daily_r18"
+			}
+		}
+		return true, false, resolvedMode
+	}
+
+	if strings.Contains(resolvedMode, "r18") {
+		return true, false, resolvedMode
+	}
+	return false, false, resolvedMode
+}
+
 // RandomImage godoc
 // @Summary Get random image
 // @Description Returns a random single-page illustration from Pixiv ranking
 // @Tags images
 // @Produce image/png,image/jpeg,image/gif
-// @Param mode query string false "Ranking mode: daily, weekly, monthly, rookie, original, male, female, daily_ai" default(daily)
+// @Param mode query string false "Ranking mode: daily, weekly, monthly, rookie, original, male, female, daily_ai, daily_r18, weekly_r18" default(daily)
 // @Param quality query string false "Image quality: original, regular, small, thumb, mini" default(regular)
+// @Param r18 query bool false "Enable or disable R-18 (true/false)"
+// @Param safe query bool false "Force safe all-ages content only (true/false)"
 // @Success 200 {file} binary
+// @Failure 401 {object} APIError
 // @Failure 404 {object} APIError
 // @Failure 500 {object} APIError
 // @Router /image [get]
@@ -527,16 +669,39 @@ func RandomImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mode := r.URL.Query().Get("mode")
-	if mode == "" {
-		mode = "daily"
+	rawMode := r.URL.Query().Get("mode")
+	allowR18, blockR18, mode := parseR18Preference(r, rawMode)
+
+	// If R-18 is requested, ensure client has auth session
+	if allowR18 && !client.IsLoggedIn() && client.GetCookie() == "" && !client.HasTokens() {
+		writeError(w, http.StatusUnauthorized, "Pixiv session cookie (PIXIV_COOKIE) is required to access R-18/NSFW content")
+		return
+	}
+
+	// 1. Check local 5GB S3 pool first if enabled (instant response, zero Pixiv dependency)
+	if storage.Pool.IsEnabled() && rawMode == "" {
+		obj, meta, err := storage.Pool.GetRandomImage(r.Context(), allowR18, blockR18)
+		if err == nil && obj != nil {
+			defer obj.Close()
+			w.Header().Set("Content-Type", meta.ContentType)
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+			w.Header().Set("Cache-Control", "no-cache")
+			w.Header().Set("X-Illust-ID", strconv.Itoa(meta.IllustID))
+			w.Header().Set("X-Illust-Title", meta.Title)
+			w.Header().Set("X-Illust-Author", meta.Author)
+			w.Header().Set("X-Pool-Cached", "true")
+			w.Header().Set("X-Aspect-Ratio", fmt.Sprintf("%.2f", meta.AspectRatio))
+			w.Header().Set("X-Is-R18", strconv.FormatBool(meta.IsR18))
+			io.Copy(w, obj)
+			return
+		}
 	}
 
 	// Quality parameter: original (default), regular, small, thumb, mini
 	quality := imageQualityOrDefault(r.URL.Query().Get("quality"))
 
-	// Fetch several cached ranking pages for a larger pool with fewer repeats.
-	results, err := client.GetRankingBatch(mode, 8, "")
+	// Fetch cached ranking batch (2 pages is 100 illustrations, avoiding Pixiv rate limit)
+	results, err := client.GetRankingBatch(mode, 2, "")
 	if err != nil {
 		results, err = client.GetRanking(mode, 1, "")
 		if err != nil {
@@ -550,24 +715,35 @@ func RandomImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Filter to only single-page illustrations (not manga)
-	// illust_type: "0" = illustration, "1" = manga, "2" = ugoira (animation)
+	// Filter to only single-page illustrations (not manga) and enforce R-18 / safe filtering
 	var singleImages []pixiv.RankingItem
 	for _, item := range results.Contents {
-		// Only include single-page illustrations (type "0" or empty) with 1 page
 		isIllustration := item.IllustType == "0" || item.IllustType == ""
 		isSinglePage := item.GetPageCount() <= 1
-		if isIllustration && isSinglePage {
-			singleImages = append(singleImages, item)
+		if !isIllustration || !isSinglePage {
+			continue
 		}
+
+		// When blocking R-18 / NSFW, filter out any tagged or titled R-18 items
+		if blockR18 || (!allowR18 && !strings.Contains(mode, "r18")) {
+			if item.IsR18() {
+				continue
+			}
+		}
+
+		singleImages = append(singleImages, item)
 	}
 
 	if len(singleImages) == 0 {
-		writeError(w, http.StatusNotFound, "No single illustrations found, try /manga for manga works")
+		writeError(w, http.StatusNotFound, "No matching single illustrations found, try /manga for manga works")
 		return
 	}
 
-	item, ok := pickFreshRankingItem("image:"+mode, singleImages)
+	cachePrefix := "image:" + mode
+	if blockR18 {
+		cachePrefix += ":safe"
+	}
+	item, ok := pickFreshRankingItem(cachePrefix, singleImages)
 	if !ok {
 		writeError(w, http.StatusNotFound, "No single illustrations found, try /manga for manga works")
 		return
@@ -645,6 +821,7 @@ func RandomImage(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Illust-Title", item.Title)
 	w.Header().Set("X-Illust-Author", item.UserName)
 	w.Header().Set("X-Image-Quality", quality)
+	w.Header().Set("X-Is-R18", strconv.FormatBool(item.IsR18() || strings.Contains(mode, "r18")))
 
 	io.Copy(w, body)
 }
@@ -654,11 +831,14 @@ func RandomImage(w http.ResponseWriter, r *http.Request) {
 // @Description Returns a random page from a multi-page manga work
 // @Tags images
 // @Produce image/png,image/jpeg,image/gif
-// @Param mode query string false "Ranking mode: daily, weekly, monthly, rookie, original, male, female, daily_ai" default(daily)
+// @Param mode query string false "Ranking mode: daily, weekly, monthly, rookie, original, male, female, daily_ai, daily_r18, weekly_r18" default(daily)
 // @Param quality query string false "Image quality: original, regular, small, thumb, mini" default(regular)
+// @Param r18 query bool false "Enable or disable R-18 (true/false)"
+// @Param safe query bool false "Force safe all-ages content only (true/false)"
 // @Param page query int false "Specific page index (0-indexed), default random"
 // @Param all query bool false "Return JSON with all page URLs instead of image"
 // @Success 200 {file} binary
+// @Failure 401 {object} APIError
 // @Failure 404 {object} APIError
 // @Failure 500 {object} APIError
 // @Router /manga [get]
@@ -668,9 +848,32 @@ func RandomManga(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mode := r.URL.Query().Get("mode")
-	if mode == "" {
-		mode = "daily"
+	rawMode := r.URL.Query().Get("mode")
+	allowR18, blockR18, mode := parseR18Preference(r, rawMode)
+
+	// If R-18 is requested, ensure client has auth session
+	if allowR18 && !client.IsLoggedIn() && client.GetCookie() == "" && !client.HasTokens() {
+		writeError(w, http.StatusUnauthorized, "Pixiv session cookie (PIXIV_COOKIE) is required to access R-18/NSFW content")
+		return
+	}
+
+	// 1. Check local 5GB S3 pool first if enabled (instant response, zero Pixiv dependency)
+	if storage.Pool.IsEnabled() && rawMode == "" {
+		obj, meta, err := storage.Pool.GetRandomImage(r.Context(), allowR18, blockR18)
+		if err == nil && obj != nil {
+			defer obj.Close()
+			w.Header().Set("Content-Type", meta.ContentType)
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+			w.Header().Set("Cache-Control", "no-cache")
+			w.Header().Set("X-Illust-ID", strconv.Itoa(meta.IllustID))
+			w.Header().Set("X-Illust-Title", meta.Title)
+			w.Header().Set("X-Illust-Author", meta.Author)
+			w.Header().Set("X-Pool-Cached", "true")
+			w.Header().Set("X-Aspect-Ratio", fmt.Sprintf("%.2f", meta.AspectRatio))
+			w.Header().Set("X-Is-R18", strconv.FormatBool(meta.IsR18))
+			io.Copy(w, obj)
+			return
+		}
 	}
 
 	// Quality parameter: original (default), regular, small, thumb, mini
@@ -685,8 +888,8 @@ func RandomManga(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Fetch several cached ranking pages for a larger pool with fewer repeats.
-	results, err := client.GetRankingBatch(mode, 8, "")
+	// Fetch cached ranking batch (2 pages is 100 illustrations, avoiding Pixiv rate limit)
+	results, err := client.GetRankingBatch(mode, 2, "")
 	if err != nil {
 		results, err = client.GetRanking(mode, 1, "")
 		if err != nil {
@@ -700,23 +903,35 @@ func RandomManga(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Filter to manga works (type "1" or multi-page works)
-	// illust_type: "0" = illustration, "1" = manga, "2" = ugoira (animation)
+	// Filter to manga works (type "1" or multi-page works) and enforce R-18 / safe filtering
 	var mangaWorks []pixiv.RankingItem
 	for _, item := range results.Contents {
 		isMangaType := item.IllustType == "1"
 		isMultiPage := item.GetPageCount() > 1
-		if isMangaType || isMultiPage {
-			mangaWorks = append(mangaWorks, item)
+		if !isMangaType && !isMultiPage {
+			continue
 		}
+
+		// When blocking R-18 / NSFW, filter out any tagged or titled R-18 items
+		if blockR18 || (!allowR18 && !strings.Contains(mode, "r18")) {
+			if item.IsR18() {
+				continue
+			}
+		}
+
+		mangaWorks = append(mangaWorks, item)
 	}
 
 	if len(mangaWorks) == 0 {
-		writeError(w, http.StatusNotFound, "No manga found, try /image for single illustrations")
+		writeError(w, http.StatusNotFound, "No matching manga found, try /image for single illustrations")
 		return
 	}
 
-	item, ok := pickFreshRankingItem("manga:"+mode, mangaWorks)
+	cachePrefix := "manga:" + mode
+	if blockR18 {
+		cachePrefix += ":safe"
+	}
+	item, ok := pickFreshRankingItem(cachePrefix, mangaWorks)
 	if !ok {
 		writeError(w, http.StatusNotFound, "No manga found, try /image for single illustrations")
 		return
@@ -796,6 +1011,7 @@ func RandomManga(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Page-Count", strconv.Itoa(len(pages)))
 	w.Header().Set("X-Current-Page", strconv.Itoa(pageIndex))
 	w.Header().Set("X-Image-Quality", quality)
+	w.Header().Set("X-Is-R18", strconv.FormatBool(item.IsR18() || strings.Contains(mode, "r18")))
 
 	io.Copy(w, body)
 }
@@ -857,4 +1073,27 @@ func GetRanking(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeSuccess(w, results)
+}
+
+// PoolStats godoc
+// @Summary Get S3 & Redis Random Pool statistics
+// @Description Returns cache pool usage, image count, and aspect ratio metrics
+// @Tags images
+// @Produce json
+// @Success 200 {object} APISuccess
+// @Router /api/pool/stats [get]
+func PoolStats(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	if storage.Pool.IsEnabled() {
+		writeSuccess(w, storage.Pool.PoolStats(r.Context()))
+	} else {
+		writeSuccess(w, map[string]interface{}{
+			"enabled": false,
+			"message": "S3 & Redis random pool is not configured or disabled",
+		})
+	}
 }

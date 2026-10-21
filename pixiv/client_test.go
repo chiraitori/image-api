@@ -81,3 +81,40 @@ func TestImageURLNormalizeAndQuality(t *testing.T) {
 		t.Fatalf("URLForQuality(regular) = %q, want regular.jpg", got)
 	}
 }
+
+func TestRankingItemIsR18(t *testing.T) {
+	tests := []struct {
+		name string
+		item RankingItem
+		want bool
+	}{
+		{
+			name: "all ages clean",
+			item: RankingItem{Title: "Beautiful Landscape", Tags: []string{"landscape", "scenery"}},
+			want: false,
+		},
+		{
+			name: "r-18 tag",
+			item: RankingItem{Title: "Cute Girl", Tags: []string{"R-18", "original"}},
+			want: true,
+		},
+		{
+			name: "r-18g tag",
+			item: RankingItem{Title: "Gore", Tags: []string{"R-18G"}},
+			want: true,
+		},
+		{
+			name: "r18 lowercase in title",
+			item: RankingItem{Title: "Some illustration (R18)"},
+			want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.item.IsR18(); got != tt.want {
+				t.Fatalf("IsR18() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}

@@ -55,6 +55,7 @@ func main() {
 	mux.HandleFunc("/api/auth/token", handlers.SetTokens)
 	mux.HandleFunc("/api/auth/code", handlers.ExchangeCode)
 	mux.HandleFunc("/api/auth/refresh", handlers.RefreshToken)
+	mux.HandleFunc("/api/pool/stats", handlers.PoolStats)
 	mux.HandleFunc("/health", handlers.HealthCheck)
 
 	// Kemono API proxy endpoints
@@ -67,9 +68,8 @@ func main() {
 		httpSwagger.URL("/swagger/doc.json"),
 	))
 
-	// Paperback extensions - serve static files from bundles folder
-	fs := http.FileServer(http.Dir("paperback-extensions/bundles"))
-	mux.Handle("/paperback/", http.StripPrefix("/paperback/", fs))
+	// Paperback extensions - serve dynamic API and fallback to static bundle files
+	mux.HandleFunc("/paperback/", handlers.PaperbackHandler("paperback-extensions/bundles"))
 
 	log.Printf("Starting server on port %s", port)
 	log.Printf("Swagger docs available at http://localhost:%s/swagger/", port)

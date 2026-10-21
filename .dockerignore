@@ -1,0 +1,11 @@
+.git
+.github
+*.exe
+.env
+.tokens.json
+node_modules
+paperback-extensions/node_modules
+paperback-extensions/src
+tmp
+.vscode
+.idea
