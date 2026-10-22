@@ -1,6 +1,6 @@
 module image-api
 
-go 1.26.0
+go 1.26.10
 
 require (
 	github.com/joho/godotenv v1.5.1
@@ -8,6 +8,7 @@ require (
 	github.com/redis/go-redis/v9 v9.23.0
 	github.com/swaggo/http-swagger v1.3.4
 	github.com/swaggo/swag v1.16.6
+	golang.org/x/image v0.47.0
 )
 
 require (
@@ -38,7 +39,6 @@ require (
 	go.uber.org/atomic v1.12.0 // indirect
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	golang.org/x/crypto v0.57.0 // indirect
-	golang.org/x/image v0.47.0 // indirect
 	golang.org/x/mod v0.41.0 // indirect
 	golang.org/x/net v0.60.0 // indirect
 	golang.org/x/sync v0.24.0 // indirect
